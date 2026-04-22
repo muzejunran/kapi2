@@ -1,0 +1,31 @@
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY internal/llm/ ./internal/llm/
+COPY internal/config/ ./internal/config/
+
+# Build the mock LLM service
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o llm-service internal/llm/llm.go
+
+# Runtime stage
+FROM alpine:latest
+
+WORKDIR /root/
+
+# Copy the binary
+COPY --from=builder /app/llm-service .
+
+# Expose port
+EXPOSE 8082
+
+# Run the service
+CMD ["./llm-service"]

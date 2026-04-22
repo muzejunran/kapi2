@@ -1,0 +1,53 @@
+{
+  "id": "add_bill",
+  "name": "add_bill",
+  "description": "添加账单 - 将用户的自然语言转换为结构化账单",
+  "type": "org",
+  "version": "1.0.0",
+  "pages": ["bills.add", "home"],
+  "schema": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "amount": {
+          "type": "number",
+          "description": "金额"
+        },
+        "category": {
+          "type": "string",
+          "description": "分类"
+        },
+        "description": {
+          "type": "string",
+          "description": "描述"
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "时间戳"
+        }
+      },
+      "required": ["amount", "category"]
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "bill_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "metadata": {
+    "timeout": 5000,
+    "retry_count": 2
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "id": "query_bills",
+  "name": "query_bills",
+  "description": "查询账单 - 根据条件聚合查询账单数据",
+  "type": "org",
+  "version": "1.0.0",
+  "pages": ["bills.list", "bills.detail", "dashboard"],
+  "schema": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "分类筛选"
+        },
+        "date_range": {
+          "type": "object",
+          "properties": {
+            "start": {
+              "type": "string",
+              "format": "date"
+            },
+            "end": {
+              "type": "string",
+              "format": "date"
+            }
+          }
+        },
+        "amount_range": {
+          "type": "object",
+          "properties": {
+            "min": {
+              "type": "number"
+            },
+            "max": {
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "total": {
+          "type": "number"
+        },
+        "bills": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "summary": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "metadata": {
+    "timeout": 3000,
+    "cache_ttl": 300
+  }
+}

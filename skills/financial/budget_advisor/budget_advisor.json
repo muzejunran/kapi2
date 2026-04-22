@@ -1,0 +1,49 @@
+{
+  "id": "budget_advisor",
+  "name": "预算建议",
+  "description": "根据收入和支出提供预算建议",
+  "version": "1.0.0",
+  "enabled": true,
+  "supported_pages": ["query_bills", "budget"],
+
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "budget_advisor",
+        "description": "根据收入和支出提供预算建议",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "income": {
+              "type": "number",
+              "minimum": 0,
+              "description": "月收入（元）"
+            },
+            "expenses": {
+              "type": "number",
+              "minimum": 0,
+              "description": "月支出（元），可选"
+            }
+          },
+          "required": ["income"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+
+  "runtime_config": {
+    "default_timeout_ms": 10000,
+    "max_retries": 1,
+    "error_message": "生成预算建议失败，请稍后重试"
+  },
+
+  "metadata": {
+    "author": "system",
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-04-21T00:00:00Z",
+    "tags": ["finance", "budget", "advice"],
+    "priority": 5
+  }
+}

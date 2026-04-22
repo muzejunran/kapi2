@@ -1,0 +1,58 @@
+{
+  "id": "query_bills",
+  "name": "查询账单",
+  "description": "查询指定时间段内的账单记录",
+  "version": "1.0.0",
+  "enabled": true,
+  "supported_pages": ["query_bills"],
+
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "query_bills",
+        "description": "查询指定时间段内的账单记录",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "start_date": {
+              "type": "string",
+              "format": "date",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "description": "开始日期，格式: YYYY-MM-DD"
+            },
+            "end_date": {
+              "type": "string",
+              "format": "date",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "description": "结束日期，格式: YYYY-MM-DD"
+            },
+            "category": {
+              "type": "string",
+              "description": "筛选分类（可选）"
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+
+  "runtime_config": {
+    "default_timeout_ms": 3000,
+    "max_retries": 2,
+    "error_message": "查询账单失败，请稍后重试",
+    "default_params": {
+      "end_date": "{{.Today}}"
+    }
+  },
+
+  "metadata": {
+    "author": "system",
+    "created_at": "2024-01-01T00:00:00Z",
+    "updated_at": "2024-04-21T00:00:00Z",
+    "tags": ["finance", "bill", "query"],
+    "priority": 10
+  }
+}

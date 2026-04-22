@@ -1,0 +1,60 @@
+{
+  "id": "budget_advisor",
+  "name": "budget_advisor",
+  "description": "预算顾问 - 基于预算和现金流提供财务建议",
+  "type": "org",
+  "version": "1.0.0",
+  "pages": ["budget", "finance"],
+  "schema": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "income": {
+          "type": "number",
+          "description": "月收入"
+        },
+        "expenses": {
+          "type": "number",
+          "description": "月支出"
+        },
+        "savings_goal": {
+          "type": "number",
+          "description": "储蓄目标"
+        },
+        "budget_categories": {
+          "type": "object",
+          "description": "预算分类"
+        }
+      },
+      "required": ["income", "expenses"]
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "current_savings_rate": {
+          "type": "number"
+        },
+        "monthly_savings": {
+          "type": "number"
+        },
+        "advice": {
+          "type": "string"
+        },
+        "recommendations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        }
+      }
+    }
+  },
+  "metadata": {
+    "timeout": 4000,
+    "confidence_threshold": 0.7
+  }
+}

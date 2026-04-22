@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  # Redis for session storage and caching
+  redis:
+    image: redis:7-alpine
+    container_name: kapi-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # MySQL for conversation and billing storage
+  mysql:
+    image: mysql:8.0
+    container_name: kapi-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-11111111}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-kapi}
+      MYSQL_USER: ${MYSQL_USER:-kapi}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-kapi123}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Main KAPI Server
+  kapi-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kapi-server
+    ports:
+      - "8080:8080"
+    environment:
+      # Server
+      SERVER_PORT: 8080
+      MONITORING_PORT: 9090
+      JWT_SECRET: ${JWT_SECRET:-qwert}
+
+      # Redis
+      REDIS_ADDR: redis:6379
+
+      # MySQL
+      MYSQL_DSN: ${MYSQL_DSN:-kapi:kapi123@tcp(mysql:3306)/kapi?charset=utf8mb4&parseTime=true}
+
+      # LLM Configuration (外部服务，需要配置你的 LLM endpoint 和 API key)
+      LLM_ENDPOINT: ${LLM_ENDPOINT:-https://open.bigmodel.cn/api/paas/v4/chat/completions}
+      LLM_API_KEY: ${LLM_API_KEY}
+      MODEL_NAME: ${MODEL_NAME:-glm-4.6v}
+      MAX_TOKENS: ${MAX_TOKENS:-10000}
+      TEMPERATURE: ${TEMPERATURE:-0.7}
+
+      # Runtime
+      TOKEN_BUDGET: ${TOKEN_BUDGET:-1500}
+      SKILL_TIMEOUT: ${SKILL_TIMEOUT:-60s}
+      RATE_LIMIT: ${RATE_LIMIT:-100}
+
+      # Skills
+      SKILLS_BIN_DIR: skills
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  redis_data:
+    driver: local
+  mysql_data:
+    driver: local

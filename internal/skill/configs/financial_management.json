@@ -1,0 +1,89 @@
+{
+  "id": "financial_management",
+  "name": "财务管理",
+  "description": "管理用户的账单、预算和财务建议",
+  "version": "2.0.0",
+  "supported_pages": ["add_bill", "query_bills"],
+  "error_message": "抱歉，我没理解您的意思，请换种说法或补充信息",
+  "operations": {
+    "add_bill": {
+      "operation": "add_bill",
+      "name": "记账",
+      "params": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number",
+            "description": "金额"
+          },
+          "category": {
+            "type": "string",
+            "description": "分类（餐饮、购物、交通等）"
+          },
+          "description": {
+            "type": "string",
+            "description": "描述"
+          }
+        },
+        "required": ["amount", "category"]
+      },
+      "required": ["amount", "category"],
+      "optional": {
+        "description": ""
+      },
+      "needs_llm": true
+    },
+    "query_bills": {
+      "operation": "query_bills",
+      "name": "查询账单",
+      "params": {
+        "type": "object",
+        "properties": {
+          "start_date": {
+            "type": "string",
+            "description": "开始日期"
+          },
+          "end_date": {
+            "type": "string",
+            "description": "结束日期"
+          },
+          "category": {
+            "type": "string",
+            "description": "分类筛选"
+          }
+        },
+        "required": []
+      },
+      "required": [],
+      "optional": {
+        "start_date": "",
+        "end_date": "{{.Today}}",
+        "category": ""
+      },
+      "needs_llm": true
+    },
+    "budget_advisor": {
+      "operation": "budget_advisor",
+      "name": "预算建议",
+      "params": {
+        "type": "object",
+        "properties": {
+          "income": {
+            "type": "number",
+            "description": "月收入"
+          },
+          "expenses": {
+            "type": "number",
+            "description": "月支出"
+          }
+        },
+        "required": ["income"]
+      },
+      "required": ["income"],
+      "optional": {
+        "expenses": 0
+      },
+      "needs_llm": true
+    }
+  }
+}

@@ -1,0 +1,103 @@
+package config
+
+import (
+	"os"
+	"time"
+)
+
+type Config struct {
+	ServerPort     string
+	AuthPort       string
+	LLMServicePort string
+	SessionPort    string
+	MonitoringPort string
+	JWTSecret      string
+	RedisAddr      string
+	MySQLDSN       string
+	LLMApiKey      string
+	LLMEndpoint    string
+	RateLimit      int
+	TokenBudget    int
+	SkillTimeout   time.Duration
+	ModelName      string
+	MaxTokens      int
+	Temperature    float64
+	SkillsDir      string // 插件源码/配置目录
+	SkillsBinDir   string // 插件编译输出目录
+}
+
+func Load() (*Config, error) {
+	return &Config{
+		ServerPort:     getEnv("SERVER_PORT", "8080"),
+		AuthPort:       getEnv("AUTH_PORT", "8081"),
+		LLMServicePort: getEnv("LLM_PORT", "8082"),
+		SessionPort:    getEnv("SESSION_PORT", "8083"),
+		MonitoringPort: getEnv("MONITORING_PORT", "9090"),
+		JWTSecret:      getEnv("JWT_SECRET", "qwert"),
+		RedisAddr:      getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		MySQLDSN:       getEnv("MYSQL_DSN", "root:11111111@tcp(127.0.0.1:3306)/kapi?charset=utf8mb4&parseTime=true"),
+		LLMApiKey:      getEnv("LLM_API_KEY", "62c18479271e4d32a0778994b23d319d.E6iad4n3CX7fF7rE"),
+		LLMEndpoint:    getEnv("LLM_ENDPOINT", "https://open.bigmodel.cn/api/paas/v4/chat/completions"),
+		RateLimit:      getEnvInt("RATE_LIMIT", 100),
+		TokenBudget:    getEnvInt("TOKEN_BUDGET", 1500),
+		SkillTimeout:   getEnvDuration("SKILL_TIMEOUT", 60*time.Second),
+		ModelName:      getEnv("MODEL_NAME", "glm-4.6v"),
+		MaxTokens:      getEnvInt("MAX_TOKENS", 10000),
+		Temperature:    getEnvFloat("TEMPERATURE", 0.7),
+		SkillsDir:      getEnvOrEmpty("SKILLS_DIR", "skills/financial"),
+		SkillsBinDir:   getEnv("SKILLS_BIN_DIR", "skills"),
+	}, nil
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// getEnvOrEmpty 获取环境变量，如果未设置则使用默认值，但允许设置为空字符串
+func getEnvOrEmpty(key, defaultValue string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists {
+		return defaultValue
+	}
+	return value
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := parseInt(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func parseInt(s string) (int, error) {
+	// Implementation for parsing int
+	return 100, nil
+}
+
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatVal, err := parseFloat(value); err == nil {
+			return floatVal
+		}
+	}
+	return defaultValue
+}
+
+func parseFloat(s string) (float64, error) {
+	// Implementation for parsing float
+	return 0.7, nil
+}

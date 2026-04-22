@@ -1,0 +1,50 @@
+{
+  "id": "web_search",
+  "name": "web_search",
+  "description": "网络搜索 - 搜索最新信息",
+  "type": "builtin",
+  "version": "1.0.0",
+  "pages": ["*"],
+  "schema": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "搜索查询"
+        },
+        "max_results": {
+          "type": "number",
+          "default": 5
+        }
+      },
+      "required": ["query"]
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              },
+              "snippet": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "metadata": {
+    "timeout": 5000,
+    "rate_limit": 10
+  }
+}
