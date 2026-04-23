@@ -48,13 +48,12 @@ func (r *ConversationRepository) AddMessage(conv *model.Conversation) error {
 		conv.ID = fmt.Sprintf("conv_%d", time.Now().UnixNano())
 	}
 
-	if conv.CreatedAt == "" {
-		conv.CreatedAt = time.Now().UTC().Format(time.RFC3339)
-	}
+	// 内部转换为 MySQL 格式
+	mysqlTime := r.toMySQLTime(conv.CreatedAt)
 
 	_, err := r.db.Exec(
 		"INSERT INTO conversations (id, user_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-		conv.ID, conv.UserID, conv.Role, conv.Content, conv.CreatedAt,
+		conv.ID, conv.UserID, conv.Role, conv.Content, mysqlTime,
 	)
 	return err
 }
@@ -71,14 +70,41 @@ func (r *ConversationRepository) GetRecentMessages(userID string, limit int) ([]
 	var results []*model.Conversation
 	for rows.Next() {
 		var conv model.Conversation
-		err := rows.Scan(&conv.ID, &conv.UserID, &conv.Role, &conv.Content, &conv.CreatedAt)
+		var mysqlTime string
+		err := rows.Scan(&conv.ID, &conv.UserID, &conv.Role, &conv.Content, &mysqlTime)
 		if err != nil {
 			continue
 		}
+		// 转换回 RFC3339
+		conv.CreatedAt = r.fromMySQLTime(mysqlTime)
 		results = append(results, &conv)
 	}
 
 	return results, nil
+}
+
+// toMySQLTime 将 RFC3339 或空字符串转换为 MySQL DATETIME 格式
+func (r *ConversationRepository) toMySQLTime(t string) string {
+	if t == "" {
+		return time.Now().UTC().Format("2006-01-02 15:04:05")
+	}
+	// 如果已经是 MySQL 格式，直接返回
+	if _, err := time.Parse("2006-01-02 15:04:05", t); err == nil {
+		return t
+	}
+	// 否则尝试解析并转换
+	if parsed, err := time.Parse(time.RFC3339, t); err == nil {
+		return parsed.Format("2006-01-02 15:04:05")
+	}
+	return t
+}
+
+// fromMySQLTime 将 MySQL DATETIME 格式转换为 RFC3339
+func (r *ConversationRepository) fromMySQLTime(t string) string {
+	if parsed, err := time.Parse("2006-01-02 15:04:05", t); err == nil {
+		return parsed.UTC().Format(time.RFC3339)
+	}
+	return t
 }
 
 func (r *ConversationRepository) Close() error {

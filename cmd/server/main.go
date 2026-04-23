@@ -125,7 +125,7 @@ func main() {
 					UserID:    userID,
 					Role:      "user",
 					Content:   turn.UserMessage,
-					CreatedAt: now.Format(time.RFC3339),
+					CreatedAt: now.UTC().Format(time.RFC3339),
 				}); err != nil {
 					return err
 				}
@@ -135,7 +135,7 @@ func main() {
 					UserID:    userID,
 					Role:      "assistant",
 					Content:   turn.AssistantMessage,
-					CreatedAt: now.Format(time.RFC3339),
+					CreatedAt: now.UTC().Format(time.RFC3339),
 				}); err != nil {
 					return err
 				}
