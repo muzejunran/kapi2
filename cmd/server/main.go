@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -33,20 +32,10 @@ func main() {
 		stdlog.Fatalf("Failed to load config: %v", err)
 	}
 
-	// 检测当前工作目录，如果是 bin/ 目录则使用生产模式配置
-	wd, err := os.Getwd()
-	if err == nil {
-		if filepath.Base(wd) == "bin" {
-			// 生产模式：从 bin 目录启动
-			cfg.SkillsDir = ""
-			cfg.SkillsBinDir = "skills"
-			stdlog.Println("Running in production mode (bin directory)")
-		} else {
-			// 开发模式：从项目根目录启动
-			// 使用配置文件中的默认值或环境变量
-			stdlog.Println("Running in development mode (project root)")
-		}
-	}
+	// 运行模式配置（容器内固定生产模式）
+	cfg.SkillsDir = ""
+	cfg.SkillsBinDir = "skills"
+	stdlog.Println("Running in production mode")
 
 	// Setup logger
 	logger := logrus.New()

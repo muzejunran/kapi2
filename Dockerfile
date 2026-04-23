@@ -3,8 +3,8 @@ FROM golang:1.21-bullseye AS builder
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y git gcc && rm -rf /var/lib/apt/lists/*
+# Install build dependencies (gcc needed for CGO plugins)
+RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*
 
 # Copy go mod files
 COPY go.mod go.sum* ./
@@ -34,7 +34,7 @@ RUN mkdir -p bin/skills && \
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o kapi-server ./cmd/server
 
 # Runtime stage
-FROM ubuntu:22.04
+FROM debian:bullseye-slim
 
 WORKDIR /app
 
