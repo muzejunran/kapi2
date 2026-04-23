@@ -311,6 +311,7 @@ func (l *Loader) needsRebuild(goFiles []string, soFile string) bool {
 func (l *Loader) loadPlugin(soFile, skillID string) (Skill, error) {
 	p, err := stdplugin.Open(soFile)
 	if err != nil {
+		l.logger.Errorf("Failed to open plugin %s: %v", soFile, err)
 		return nil, err
 	}
 

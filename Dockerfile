@@ -30,8 +30,8 @@ RUN mkdir -p bin/skills && \
         fi \
     ' sh {} \;
 
-# Build main application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o kapi-server ./cmd/server
+# Build main application (CGO_ENABLED=1 for plugin support)
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o kapi-server ./cmd/server
 
 # Runtime stage
 FROM debian:bullseye-slim
@@ -44,6 +44,9 @@ RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib
 # Copy the binary and plugins from builder
 COPY --from=builder /app/kapi-server .
 COPY --from=builder /app/bin/skills ./skills
+
+# Make .so files executable
+RUN chmod +x ./skills/*.so
 
 # Copy web-client
 COPY web-client ./web-client
