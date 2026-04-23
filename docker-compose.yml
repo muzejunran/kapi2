@@ -72,6 +72,7 @@ services:
       RATE_LIMIT: ${RATE_LIMIT:-100}
 
       # Skills
+      SKILLS_DIR: ""
       SKILLS_BIN_DIR: skills
     depends_on:
       redis:
