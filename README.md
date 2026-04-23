@@ -12,3 +12,6 @@ docker-compose logs -f kapi-server
 
 # 4. 停止服务
 docker-compose down
+
+# 5.前端展示
+http://localhost:8080/web-client/
