@@ -1,10 +1,10 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.21-bullseye AS builder
 
 WORKDIR /app
 
 # Install build dependencies
-RUN apk add --no-cache git gcc musl-dev
+RUN apt-get update && apt-get install -y git gcc && rm -rf /var/lib/apt/lists/*
 
 # Copy go mod files
 COPY go.mod go.sum* ./
@@ -34,12 +34,12 @@ RUN mkdir -p bin/skills && \
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o kapi-server ./cmd/server
 
 # Runtime stage
-FROM alpine:latest
+FROM ubuntu:22.04
 
 WORKDIR /app
 
-# Install ca-certificates for HTTPS requests
-RUN apk --no-cache add ca-certificates wget
+# Install ca-certificates and wget for HTTPS requests
+RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary and plugins from builder
 COPY --from=builder /app/kapi-server .
