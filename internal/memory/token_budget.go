@@ -30,17 +30,13 @@ type TokenBudget struct {
 
 // CalculateTokens 估算文本的 token 数量
 func CalculateTokens(text string) int {
-	// 简单估算：中文约1.5 token/字符，英文约0.3 token/字符
-	charCount := len(text)
-	var tokensPerChar float64
-
+	total := 0.0
 	for _, r := range text {
 		if r >= 0x4e00 { // 中日韩字符
-			tokensPerChar = 1.5
-		} else { // 拉丁字符
-			tokensPerChar = 0.3
+			total += 1.5
+		} else {
+			total += 0.3
 		}
 	}
-
-	return int(float64(charCount) * tokensPerChar)
+	return int(total)
 }

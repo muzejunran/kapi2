@@ -7,25 +7,15 @@ import (
 
 // SkillRegistry manages all available skills
 type SkillRegistry struct {
-	skills      map[string]Skill
-	mu          sync.RWMutex
-	versionMgr  *SkillVersionManager
-	// TODO: Add FileWatcher support when implementing hot reload
-	// fileWatcher *FileWatcher
-	// skillPaths  map[string]string
+	skills map[string]Skill
+	mu     sync.RWMutex
 }
 
-// NewSkillRegistry creates a new skill registry with version management
+// NewSkillRegistry creates a new skill registry
 func NewSkillRegistry() *SkillRegistry {
 	return &SkillRegistry{
-		skills:     make(map[string]Skill),
-		versionMgr: NewSkillVersionManager(),
+		skills: make(map[string]Skill),
 	}
-}
-
-// GetVersionManager returns the version manager
-func (sr *SkillRegistry) GetVersionManager() *SkillVersionManager {
-	return sr.versionMgr
 }
 
 // RegisterSkill registers a new skill

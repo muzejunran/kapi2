@@ -1,0 +1,33 @@
+{
+  "id": "query_bills",
+  "name": "账单查询",
+  "description": "查询和统计用户账单数据",
+  "layer": "org",
+  "supported_pages": ["bills.detail", "bills.list", "home"],
+  "tools": [
+    {
+      "name": "query_bills",
+      "description": "查询指定时间范围和分类的账单，返回账单列表和汇总统计，例如：'本月外卖花了多少'",
+      "action_type": "llm_summary",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "start_date": {
+            "type": "string",
+            "description": "开始日期，格式 YYYY-MM-DD，不填默认本月第一天"
+          },
+          "end_date": {
+            "type": "string",
+            "description": "结束日期，格式 YYYY-MM-DD，不填默认今天"
+          },
+          "category": {
+            "type": "string",
+            "description": "账单分类过滤，不填返回全部分类",
+            "enum": ["餐饮", "购物", "交通", "娱乐", "医疗", "其他"]
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}

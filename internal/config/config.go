@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -19,11 +20,10 @@ type Config struct {
 	RateLimit      int
 	TokenBudget    int
 	SkillTimeout   time.Duration
+	SkillServerURL string // skill-server 地址
 	ModelName      string
 	MaxTokens      int
 	Temperature    float64
-	SkillsDir      string // 插件源码/配置目录
-	SkillsBinDir   string // 插件编译输出目录
 }
 
 func Load() (*Config, error) {
@@ -41,11 +41,10 @@ func Load() (*Config, error) {
 		RateLimit:      getEnvInt("RATE_LIMIT", 100),
 		TokenBudget:    getEnvInt("TOKEN_BUDGET", 1500),
 		SkillTimeout:   getEnvDuration("SKILL_TIMEOUT", 60*time.Second),
+		SkillServerURL: getEnv("SKILL_SERVER_URL", "http://localhost:8090"),
 		ModelName:      getEnv("MODEL_NAME", "test"),
 		MaxTokens:      getEnvInt("MAX_TOKENS", 10000),
 		Temperature:    getEnvFloat("TEMPERATURE", 0.7),
-		SkillsDir:      getEnvOrEmpty("SKILLS_DIR", "skills/financial"),
-		SkillsBinDir:   getEnv("SKILLS_BIN_DIR", "skills"),
 	}, nil
 }
 
@@ -56,14 +55,6 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// getEnvOrEmpty 获取环境变量，如果未设置则使用默认值，但允许设置为空字符串
-func getEnvOrEmpty(key, defaultValue string) string {
-	value, exists := os.LookupEnv(key)
-	if !exists {
-		return defaultValue
-	}
-	return value
-}
 
 func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
@@ -75,8 +66,7 @@ func getEnvInt(key string, defaultValue int) int {
 }
 
 func parseInt(s string) (int, error) {
-	// Implementation for parsing int
-	return 100, nil
+	return strconv.Atoi(s)
 }
 
 func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
@@ -98,6 +88,5 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 }
 
 func parseFloat(s string) (float64, error) {
-	// Implementation for parsing float
-	return 0.7, nil
+	return strconv.ParseFloat(s, 64)
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"ai-assistant-service/internal/logger"
 	"ai-assistant-service/internal/memory"
 	"ai-assistant-service/internal/session"
-	"ai-assistant-service/internal/skill"
 	"ai-assistant-service/internal/streaming"
 
 	"github.com/sirupsen/logrus"
@@ -61,22 +62,22 @@ type ToolResult struct {
 
 // AgentConfig holds agent configuration
 type AgentConfig struct {
-	LLMEndpoint   string
-	LLMApiKey     string
-	ModelName     string
-	MaxTokens     int
-	Temperature   float64
-	StreamEnabled bool
-	TokenBudget   int
-	SkillTimeout  time.Duration
+	LLMEndpoint    string
+	LLMApiKey      string
+	ModelName      string
+	MaxTokens      int
+	Temperature    float64
+	StreamEnabled  bool
+	TokenBudget    int
+	SkillTimeout   time.Duration
+	SkillServerURL string
 }
 
 // Agent represents the conversational AI agent
 type Agent struct {
 	config         AgentConfig
-	skillRegistry  *skill.SkillRegistry
-	toolRegistry   *skill.ToolRegistry
-	toolExecutor   *skill.ToolExecutor
+	skillServerURL string
+	httpClient     *http.Client
 	memoryService  *memory.MemoryService
 	sessionManager *session.Manager
 	streamer       *streaming.Streamer
@@ -85,25 +86,22 @@ type Agent struct {
 }
 
 // NewAgent creates a new agent instance
-func NewAgent(cfg AgentConfig, skillReg *skill.SkillRegistry, toolReg *skill.ToolRegistry, toolExec *skill.ToolExecutor, memService *memory.MemoryService, sessionMgr *session.Manager, streamer *streaming.Streamer) *Agent {
+func NewAgent(cfg AgentConfig, memService *memory.MemoryService, sessionMgr *session.Manager, streamer *streaming.Streamer) *Agent {
 	return &Agent{
 		config:         cfg,
-		skillRegistry:  skillReg,
-		toolRegistry:   toolReg,
-		toolExecutor:   toolExec,
+		skillServerURL: cfg.SkillServerURL,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
 		memoryService:  memService,
 		sessionManager: sessionMgr,
 		streamer:       streamer,
-		logger:         logrus.New(),
+		logger:         logger.New(),
 	}
 }
 
 // ProcessMessage processes a user message and returns the response
 func (a *Agent) ProcessMessage(ctx context.Context, sessionID, userID, pageContext, message string) (<-chan streaming.StreamEvent, error) {
-	// Load session history
 	sess, err := a.sessionManager.GetSession(sessionID)
 	if err != nil {
-		// Session not found, return empty history
 		a.logger.WithFields(logrus.Fields{
 			"session_id": sessionID,
 			"error":      err,
@@ -115,7 +113,6 @@ func (a *Agent) ProcessMessage(ctx context.Context, sessionID, userID, pageConte
 		}
 	}
 
-	// Convert session messages to Agent messages
 	messageHistory := make([]Message, 0, len(sess.Messages))
 	for _, msg := range sess.Messages {
 		role, _ := msg["role"].(string)
@@ -124,12 +121,11 @@ func (a *Agent) ProcessMessage(ctx context.Context, sessionID, userID, pageConte
 			messageHistory = append(messageHistory, Message{
 				Role:      role,
 				Content:   content,
-				Timestamp: time.Now(), // Session doesn't store timestamp
+				Timestamp: time.Now(),
 			})
 		}
 	}
 
-	// Create state
 	state := &AgentState{
 		SessionID:      sessionID,
 		UserID:         userID,
@@ -138,30 +134,23 @@ func (a *Agent) ProcessMessage(ctx context.Context, sessionID, userID, pageConte
 		CurrentUserMsg: message,
 	}
 
-	// Load memory
 	mem, err := a.memoryService.GetUserMemory(userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load memory: %w", err)
 	}
-	state.Memory = mem
+	state.Memory = a.memoryService.TrimToBudget(mem)
 
-	// Add user message to history
-	userMsg := Message{
+	state.MessageHistory = append(state.MessageHistory, Message{
 		Role:      "user",
 		Content:   message,
 		Timestamp: time.Now(),
-	}
-	state.MessageHistory = append(state.MessageHistory, userMsg)
+	})
 
-	// Create stream channel
 	streamChan := make(chan streaming.StreamEvent, 100)
 
 	go func() {
 		defer close(streamChan)
-
-		// Stream the response
-		err := a.streamResponse(ctx, state, streamChan)
-		if err != nil {
+		if err := a.streamResponse(ctx, state, streamChan); err != nil {
 			a.logger.WithError(err).Error("Error streaming response")
 			streamChan <- streaming.StreamEvent{
 				Type:    streaming.ErrorEvent,
@@ -173,577 +162,282 @@ func (a *Agent) ProcessMessage(ctx context.Context, sessionID, userID, pageConte
 	return streamChan, nil
 }
 
-// streamResponse streams the response back to the client
+// streamResponse drives the full agent turn
 func (a *Agent) streamResponse(ctx context.Context, state *AgentState, streamChan chan<- streaming.StreamEvent) error {
-	// Send start event
-	streamChan <- streaming.StreamEvent{
-		Type: streaming.StartEvent,
-	}
+	streamChan <- streaming.StreamEvent{Type: streaming.StartEvent}
 
-	// 1. 检查是否有对应的 Skill
-	agentCtx := skill.AgentContext{
-		UserID:      state.UserID,
-		PageContext: state.PageContext,
-		Message:     state.CurrentUserMsg,
-	}
-
-	a.logger.WithFields(logrus.Fields{
-		"page_context": state.PageContext,
-		"message":      state.CurrentUserMsg,
-	}).Info("Checking for matching skill")
-
-	skill, score := a.skillRegistry.GetBestSkillForContext(agentCtx)
-
-	a.logger.WithFields(logrus.Fields{
-		"score": score,
-		"skill_id": func() string {
-			if skill != nil {
-				return skill.GetID()
-			}
-			return "nil"
-		}(),
-	}).Info("Skill match result")
-
-	var response *Message
-	var err error
-
-	if score > 0 {
-		// 2. 有对应的 Skill，让 Skill 处理
-		a.logger.Info("Using skill to process request")
-		response, err = a.processWithSkill(ctx, state, skill, streamChan)
-	} else {
-		// 3. 没有对应 Skill，普通聊天
-		a.logger.Info("Using LLM to process request")
-		response, err = a.processWithLLM(ctx, state, streamChan)
-	}
-
+	response, err := a.runAgentLoop(ctx, state, streamChan)
 	if err != nil {
 		return err
 	}
 
-	// 4. Save conversation to memory
-	err = a.memoryService.AddConversationTurn(state.UserID, state.CurrentUserMsg, response.Content)
-	if err != nil {
+	if err := a.memoryService.AddConversationTurn(state.UserID, state.CurrentUserMsg, response.Content); err != nil {
 		a.logger.WithError(err).Warn("Failed to save conversation to memory")
 	}
 
-	// 5. Save conversation to session
 	a.saveSession(state, response)
 
-	// 6. Send done event
-	streamChan <- streaming.StreamEvent{
-		Type: streaming.DoneEvent,
-	}
-
+	streamChan <- streaming.StreamEvent{Type: streaming.DoneEvent}
 	return nil
 }
 
-// preparePrompt prepares the prompt including memory context
-func (a *Agent) preparePrompt(state *AgentState) (string, error) {
-	// Build system prompt with memory
-	systemPrompt := a.buildSystemPrompt(state)
+// runAgentLoop implements the Function Calling loop with skill-server.
+// Stage 1: skill-server filters tools by page_context (hard filter).
+// Stage 2: LLM decides which tool to call (semantic selection).
+// Stage 3: execute tool, branch on action_type, loop or return.
+func (a *Agent) runAgentLoop(ctx context.Context, state *AgentState, streamChan chan<- streaming.StreamEvent) (*Message, error) {
+	log := logger.FromContext(ctx)
+	log.WithFields(logrus.Fields{
+		"session_id": state.SessionID,
+		"user_id":    state.UserID,
+		"page":       state.PageContext,
+	}).Info("[agent] loop started")
 
-	// Include conversation history
-	prompt := systemPrompt + "\n\n"
-	for _, msg := range state.MessageHistory {
-		prompt += fmt.Sprintf("%s: %s\n", msg.Role, msg.Content)
-	}
-
-	return prompt, nil
-}
-
-// buildSystemPrompt builds the system prompt with memory context
-func (a *Agent) buildSystemPrompt(state *AgentState) string {
-	prompt := "You are an AI assistant for 咔皮记账 (KaPi Accounting). Help users manage their finances.\n\n"
-
-	// Add memory context
-	if state.Memory.Profile != "" {
-		prompt += fmt.Sprintf("User Profile: %s\n", state.Memory.Profile)
-	}
-	if state.Memory.Preferences != "" {
-		prompt += fmt.Sprintf("User Preferences: %s\n", state.Memory.Preferences)
-	}
-	if len(state.Memory.Facts) > 0 {
-		prompt += "User Facts:\n"
-		for _, fact := range state.Memory.Facts {
-			prompt += "- " + fact + "\n"
-		}
-	}
-
-	// Add page context
-	prompt += fmt.Sprintf("\nCurrent Page: %s\n", state.PageContext)
-
-	// Get available tools from skills that can handle this context
-	agentCtx := skill.AgentContext{
-		UserID:      state.UserID,
-		PageContext: state.PageContext,
-		Message:     state.CurrentUserMsg,
-	}
-
-	tools := a.skillRegistry.GetToolsForContext(agentCtx)
-	if len(tools) > 0 {
-		prompt += "Available tools:\n"
-		for _, tool := range tools {
-			prompt += fmt.Sprintf("- %s: %s\n", tool.Name, tool.Description)
-		}
-	}
-
-	// Add explicit tool calling rules
-	prompt += "\nTool Calling Rules:\n"
-
-	// Check if add_bill tool is available
-	for _, tool := range tools {
-		if tool.Name == "add_bill" {
-			prompt += "- When user wants to add a bill (mentions amount, expense, record, 记账, 账单, etc.), you MUST call the add_bill function.\n"
-			prompt += "  Extract: amount (number), category (like 餐饮, 购物, etc.), description (what was bought), timestamp\n"
-		}
-		if tool.Name == "query_bills" {
-			prompt += "- When user wants to query bills, search expenses, or ask about spending history, call the query_bills function.\n"
-		}
-		if tool.Name == "budget_advisor" {
-			prompt += "- When user asks for budget advice, spending recommendations, or savings tips, call the budget_advisor function.\n"
-			prompt += "  Extract: income, expenses, savings_goal if mentioned\n"
-		}
-	}
-
-	prompt += "\nRemember to:"
-	prompt += "1. Be concise and helpful"
-	prompt += "2. PROACTIVELY use available tools when user requests match the above rules"
-	prompt += "3. Remember user preferences"
-	prompt += "4. Keep track of important facts"
-
-	return prompt
-}
-
-// CallTool executes a tool with the given arguments
-func (a *Agent) CallTool(toolName string, args map[string]interface{}) (interface{}, error) {
-	tool, exists := a.toolRegistry.GetTool(toolName)
-	if !exists {
-		return nil, fmt.Errorf("tool not found: %s", toolName)
-	}
-
-	// Execute the tool using the executor
-	result, err := a.toolExecutor.Execute(context.Background(), tool, args)
+	tools, err := a.getSkillsFromServer(ctx, state.PageContext)
 	if err != nil {
-		return nil, fmt.Errorf("tool execution failed: %w", err)
+		log.WithError(err).Warn("[agent] skill-server unreachable, proceeding without tools")
 	}
 
-	return result, nil
-}
-
-// processWithSkill 使用 Skill 处理请求
-func (a *Agent) processWithSkill(ctx context.Context, state *AgentState, selectedSkill skill.Skill, streamChan chan<- streaming.StreamEvent) (*Message, error) {
-	// 1. 从 Skill 获取参数提取 Schema
-	agentCtx := skill.AgentContext{
-		UserID:      state.UserID,
-		PageContext: state.PageContext,
-		Message:     state.CurrentUserMsg,
+	systemPrompt := a.buildSystemPrompt(state)
+	messages := make([]map[string]interface{}, 0, len(state.MessageHistory)+1)
+	messages = append(messages, map[string]interface{}{"role": "system", "content": systemPrompt})
+	for _, m := range state.MessageHistory {
+		messages = append(messages, map[string]interface{}{"role": m.Role, "content": m.Content})
 	}
-	schema := selectedSkill.GetExtractionSchema(agentCtx)
 
-	// 2. 调用 LLM 提取参数（非流式）
-	var extractedParams map[string]interface{}
-	if schema != "" {
-		params, err := a.callLLMForParameterExtraction(ctx, state.CurrentUserMsg, schema)
+	var finalContent strings.Builder
+
+	for iter := 0; iter < 5; iter++ {
+		req := a.buildLLMRequest(messages, true)
+		if len(tools) > 0 {
+			req["tools"] = tools
+			req["tool_choice"] = "auto"
+		}
+
+		content, toolCalls, err := a.callLLMStreamInternal(ctx, req, streamChan, state.SessionID)
 		if err != nil {
-			a.logger.WithError(err).Warn("Failed to extract parameters with LLM, using fallback")
-			extractedParams = a.getFallbackParams(selectedSkill.GetID(), state.CurrentUserMsg)
-		} else {
-			extractedParams = params
+			a.logger.WithError(err).Warn("LLM call failed, using fallback")
+			return a.getMockResponse(state, streamChan), nil
 		}
-	} else {
-		extractedParams = make(map[string]interface{})
-	}
 
-	// 3. 构建请求
-	skillRequest := skill.SkillRequest{
-		Context: agentCtx,
-		Intent:  "",
-		Input:   state.CurrentUserMsg,
-		Args:    extractedParams,
-	}
-
-	// 4. 调用 Skill 处理
-	skillResponse, err := selectedSkill.Execute(ctx, skillRequest)
-	if err != nil {
-		return nil, err
-	}
-
-	// 5. 如果 Message 为空但有 Data，调用 LLM 生成自然语言（流式）
-	var finalMessage string
-	if skillResponse.Message == "" && skillResponse.Data != nil {
-		dataMap, ok := skillResponse.Data.(map[string]interface{})
-		if !ok {
-			a.logger.Warn("Failed to cast skillResponse.Data to map")
-			finalMessage = "查询成功，但数据格式错误"
-		} else {
-			// 流式输出，不需要返回完整消息
-			a.generateResponseFromDataStreaming(ctx, state.CurrentUserMsg, dataMap, streamChan)
-			finalMessage = "" // 已流式发送，这里返回空
+		// No tool calls — pure text reply, done
+		if len(toolCalls) == 0 {
+			finalContent.WriteString(content)
+			break
 		}
-	} else {
-		finalMessage = skillResponse.Message
-	}
 
-	// 6. 发送流式响应
-	if finalMessage != "" {
-		streamChan <- streaming.StreamEvent{
-			Type:    streaming.TextEvent,
-			Content: finalMessage,
-		}
-	}
-
-	return &Message{
-		Role:      "assistant",
-		Content:   finalMessage,
-		Timestamp: time.Now(),
-	}, nil
-}
-
-// generateResponseFromData 根据 skill 返回的数据生成自然语言回复
-func (a *Agent) generateResponseFromData(ctx context.Context, userQuery string, data map[string]interface{}) (string, error) {
-	// 打印完整数据用于调试
-	a.logger.WithField("full_data", data).Info("Full data from skill")
-
-	// 将数据序列化为 JSON 再解析，统一为 map[string]interface{} 类型
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-	var unifiedData map[string]interface{}
-	if err := json.Unmarshal(dataJSON, &unifiedData); err != nil {
-		return "", err
-	}
-
-	// 构建更友好的数据展示格式
-	dataDisplay := a.formatDataForLLM(unifiedData)
-
-	// 构建请求
-	messages := []map[string]interface{}{
-		{
-			"role":    "system",
-			"content": "你是咔皮记账的 AI 助手。根据用户的问题和查询结果，用自然语言回答用户。",
-		},
-		{
-			"role":    "user",
-			"content": fmt.Sprintf("用户问题：%s\n\n查询结果：\n%s\n\n请根据查询结果用自然语言回答用户的问题。", userQuery, dataDisplay),
-		},
-	}
-
-	req := map[string]interface{}{
-		"model":       a.config.ModelName,
-		"messages":    messages,
-		"max_tokens":  2000,
-		"temperature": 0.7,
-		"stream":      false,
-	}
-
-	reqBody, err := json.Marshal(req)
-	if err != nil {
-		return "", err
-	}
-
-	a.logger.WithField("request", string(reqBody)).Info("Sending response generation request to LLM")
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.config.LLMEndpoint, strings.NewReader(string(reqBody)))
-	if err != nil {
-		return "", err
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.config.LLMApiKey)
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("LLM API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	type LLMChoice struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	}
-
-	type LLMResponse struct {
-		Choices []LLMChoice `json:"choices"`
-		Error   *struct {
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return "", err
-	}
-
-	if llmResp.Error != nil {
-		return "", fmt.Errorf("LLM API error: %s", llmResp.Error.Message)
-	}
-
-	if len(llmResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in LLM response")
-	}
-
-	return llmResp.Choices[0].Message.Content, nil
-}
-
-// processWithLLM 使用 LLM 处理普通聊天（带上下文）
-func (a *Agent) processWithLLM(ctx context.Context, state *AgentState, streamChan chan<- streaming.StreamEvent) (*Message, error) {
-	// 构建系统提示词
-	systemPrompt := a.buildSystemPrompt(state)
-
-	// 构建消息列表
-	messages := make([]map[string]interface{}, len(state.MessageHistory)+1)
-	messages[0] = map[string]interface{}{
-		"role":    "system",
-		"content": systemPrompt,
-	}
-	for i, msg := range state.MessageHistory {
-		messages[i+1] = map[string]interface{}{
-			"role":    msg.Role,
-			"content": msg.Content,
-		}
-	}
-
-	// 准备 LLM 请求
-	req := a.buildLLMRequest(messages, true) // 流式
-
-	// 调用 LLM（流式）
-	fullContent, toolCalls, err := a.callLLMStreamInternal(ctx, req, streamChan, state.SessionID)
-	if err != nil {
-		a.logger.WithError(err).Warn("LLM 调用失败，使用兜底响应")
-		return a.getMockResponse(state, streamChan), nil
-	}
-
-	return &Message{
-		Role:      "assistant",
-		Content:   fullContent,
-		ToolCalls: toolCalls,
-		Timestamp: time.Now(),
-	}, nil
-}
-
-// getMockResponse 返回兜底响应
-func (a *Agent) getMockResponse(state *AgentState, streamChan chan<- streaming.StreamEvent) *Message {
-	// 获取用户最后一条消息
-	userMessage := ""
-	if len(state.MessageHistory) > 0 {
-		for i := len(state.MessageHistory) - 1; i >= 0; i-- {
-			if state.MessageHistory[i].Role == "user" {
-				userMessage = state.MessageHistory[i].Content
-				break
+		// Append assistant's tool_call turn to messages
+		tcs := make([]map[string]interface{}, len(toolCalls))
+		for i, tc := range toolCalls {
+			argsJSON, _ := json.Marshal(tc.Function.Arguments)
+			tcs[i] = map[string]interface{}{
+				"id":   tc.ID,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      tc.Function.Name,
+					"arguments": string(argsJSON),
+				},
 			}
 		}
-	}
+		messages = append(messages, map[string]interface{}{
+			"role":       "assistant",
+			"content":    "",
+			"tool_calls": tcs,
+		})
 
-	// 根据 userMessage 返回不同的 mock 响应
-	mockContent := "抱歉，我现在无法连接到 AI 服务。请稍后再试。"
+		// Execute each tool and collect results
+		done := false
+		for _, tc := range toolCalls {
+			// 中间步骤：执行前通知前端
+			streamChan <- streaming.StreamEvent{Type: streaming.StepEvent, Content: stepStartMsg(tc.Function.Name)}
 
-	// 简单的关键词匹配来返回更友好的响应
-	switch {
-	case containsChinese(userMessage, "记账") || containsChinese(userMessage, "花费") || containsChinese(userMessage, "支出"):
-		mockContent = "我帮您记录这笔支出。请问您想记录什么金额？或者我可以帮您查询最近的账单记录。"
-	case containsChinese(userMessage, "查询") || containsChinese(userMessage, "账单") || containsChinese(userMessage, "记录"):
-		mockContent = "我可以帮您查询账单记录。请告诉我您想查询的时间范围，比如本月或最近一周。"
-	case containsChinese(userMessage, "预算") || containsChinese(userMessage, "理财") || containsChinese(userMessage, "存钱"):
-		mockContent = "关于预算建议，建议您按照 50/30/20 法则：50% 用于必需品，30% 用于个人消费，20% 用于储蓄。您想了解哪方面的预算建议？"
-	case containsChinese(userMessage, "你好") || containsChinese(userMessage, "hi") || containsChinese(userMessage, "hello"):
-		mockContent = "您好！我是您的财务助手，我可以帮您记账、查询账单、提供预算建议。请问有什么可以帮您？"
-	case userMessage == "":
-		mockContent = "您好！我是您的财务助手，有什么可以帮您？"
-	}
+			execResp, execErr := a.executeToolOnServer(ctx, tc.Function.Name, state.UserID, tc.Function.Arguments)
 
-	// 发送流式事件
-	fullContent := mockContent
-	for _, char := range []rune(mockContent) {
-		if streamChan != nil {
-			streamChan <- streaming.StreamEvent{
-				Type:    streaming.TextEvent,
-				Content: string(char),
-			}
-		}
-	}
+			var resultContent string
+			if execErr != nil {
+				resultContent = fmt.Sprintf("error: %s", execErr.Error())
+			} else if !execResp.Success {
+				resultContent = fmt.Sprintf("error: %s", execResp.Error)
+			} else {
+				switch execResp.ActionType {
+				case "return_direct":
+					// skill-server pre-rendered the reply; stream it and stop
+					msg := execResp.Message
+					if msg == "" {
+						b, _ := json.Marshal(execResp.Result)
+						msg = string(b)
+					}
+					streamChan <- streaming.StreamEvent{Type: streaming.TextEvent, Content: msg}
+					finalContent.WriteString(msg)
+					done = true
 
-	return &Message{
-		Role:      "assistant",
-		Content:   fullContent,
-		ToolCalls: nil,
-		Timestamp: time.Now(),
-	}
-}
+				case "next_step":
+					// Chain next_tool result together for LLM summary
+					b, _ := json.Marshal(execResp.Result)
+					resultContent = string(b)
+					if execResp.NextTool != "" {
+						streamChan <- streaming.StreamEvent{Type: streaming.StepEvent, Content: stepStartMsg(execResp.NextTool)}
+						nextResp, nextErr := a.executeToolOnServer(ctx, execResp.NextTool, state.UserID, map[string]interface{}{})
+						if nextErr == nil && nextResp != nil && nextResp.Success {
+							streamChan <- streaming.StreamEvent{Type: streaming.StepEvent, Content: stepDoneMsg(execResp.NextTool, nextResp.Result)}
+							nb, _ := json.Marshal(nextResp.Result)
+							resultContent += "\n[" + execResp.NextTool + "]: " + string(nb)
+						}
+					}
+					streamChan <- streaming.StreamEvent{Type: streaming.StepEvent, Content: stepDoneMsg(tc.Function.Name, execResp.Result)}
 
-// containsChinese 检查字符串是否包含中文关键词
-func containsChinese(s, keyword string) bool {
-	for i := 0; i <= len(s)-len(keyword); i++ {
-		if s[i:i+len(keyword)] == keyword {
-			return true
-		}
-	}
-	return false
-}
-
-// getFallbackParams 为参数提取失败时提供兜底策略
-func (a *Agent) getFallbackParams(skillID, userMsg string) map[string]interface{} {
-	params := make(map[string]interface{})
-
-	switch skillID {
-	case "add_bill":
-		// add_bill 兜底：从用户消息中提取金额和分类
-		// 默认值
-		params["amount"] = 100.0
-		params["category"] = "其他"
-		params["description"] = ""
-
-		// 简单的金额提取（查找数字）
-		amount := extractNumber(userMsg)
-		if amount > 0 {
-			params["amount"] = amount
-		}
-
-		// 分类提取
-		if containsChinese(userMsg, "餐") || containsChinese(userMsg, "吃") || containsChinese(userMsg, "饭") {
-			params["category"] = "餐饮"
-		} else if containsChinese(userMsg, "买") || containsChinese(userMsg, "购") || containsChinese(userMsg, "衣服") {
-			params["category"] = "购物"
-		} else if containsChinese(userMsg, "车") || containsChinese(userMsg, "地铁") || containsChinese(userMsg, "公交") {
-			params["category"] = "交通"
-		} else if containsChinese(userMsg, "玩") || containsChinese(userMsg, "电影") || containsChinese(userMsg, "游戏") {
-			params["category"] = "娱乐"
-		} else if containsChinese(userMsg, "药") || containsChinese(userMsg, "医院") || containsChinese(userMsg, "看病") {
-			params["category"] = "医疗"
-		}
-
-	case "query_bills":
-		// query_bills 兜底：默认查询本月数据
-		now := time.Now()
-		startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-		params["start_date"] = startOfMonth.Format("2006-01-02")
-		params["end_date"] = now.Format("2006-01-02")
-		params["category"] = ""
-
-		// 尝试从消息中提取日期关键词
-		if containsChinese(userMsg, "今天") {
-			today := time.Now()
-			params["start_date"] = today.Format("2006-01-02")
-			params["end_date"] = today.Format("2006-01-02")
-		} else if containsChinese(userMsg, "昨天") {
-			yesterday := time.Now().AddDate(0, 0, -1)
-			params["start_date"] = yesterday.Format("2006-01-02")
-			params["end_date"] = yesterday.Format("2006-01-02")
-		} else if containsChinese(userMsg, "本周") || containsChinese(userMsg, "这周") {
-			now := time.Now()
-			weekday := int(now.Weekday())
-			if weekday == 0 {
-				weekday = 7
-			}
-			startOfWeek := now.AddDate(0, 0, -weekday+1)
-			params["start_date"] = startOfWeek.Format("2006-01-02")
-			params["end_date"] = now.Format("2006-01-02")
-		} else if containsChinese(userMsg, "上周") {
-			now := time.Now()
-			weekday := int(now.Weekday())
-			if weekday == 0 {
-				weekday = 7
-			}
-			startOfLastWeek := now.AddDate(0, 0, -weekday-6)
-			endOfLastWeek := now.AddDate(0, 0, -weekday)
-			params["start_date"] = startOfLastWeek.Format("2006-01-02")
-			params["end_date"] = endOfLastWeek.Format("2006-01-02")
-		} else if containsChinese(userMsg, "本月") || containsChinese(userMsg, "这个月") {
-			now := time.Now()
-			startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-			params["start_date"] = startOfMonth.Format("2006-01-02")
-			params["end_date"] = now.Format("2006-01-02")
-		} else if containsChinese(userMsg, "上月") || containsChinese(userMsg, "上个月") {
-			now := time.Now()
-			startOfLastMonth := time.Date(now.Year(), now.Month()-1, 1, 0, 0, 0, 0, now.Location())
-			endOfLastMonth := startOfLastMonth.AddDate(0, 1, -1)
-			params["start_date"] = startOfLastMonth.Format("2006-01-02")
-			params["end_date"] = endOfLastMonth.Format("2006-01-02")
-		}
-
-		// 分类筛选
-		if containsChinese(userMsg, "餐") || containsChinese(userMsg, "吃") {
-			params["category"] = "餐饮"
-		} else if containsChinese(userMsg, "购") || containsChinese(userMsg, "买") {
-			params["category"] = "购物"
-		}
-
-	default:
-		// 其他 skill 返回空参数
-	}
-
-	return params
-}
-
-// formatTimestamp 格式化时间戳，只返回日期
-func formatTimestamp(timestamp string) string {
-	if timestamp == "" {
-		return ""
-	}
-	// 尝试解析各种时间格式
-	formats := []string{
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05Z",
-		"2006-01-02",
-	}
-	for _, format := range formats {
-		if t, err := time.Parse(format, timestamp); err == nil {
-			return t.Format("2006-01-02")
-		}
-	}
-	return timestamp
-}
-
-// getKeys 获取 map 的所有键（用于调试）
-func getKeys(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-// extractNumber 从字符串中提取第一个数字
-func extractNumber(s string) float64 {
-	var numStr string
-	hasDecimal := false
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= '0' && c <= '9') || c == '.' {
-			if c == '.' {
-				if hasDecimal {
-					break
+				default: // llm_summary — feed raw result back to LLM
+					b, _ := json.Marshal(execResp.Result)
+					resultContent = string(b)
+					streamChan <- streaming.StreamEvent{Type: streaming.StepEvent, Content: stepDoneMsg(tc.Function.Name, execResp.Result)}
 				}
-				hasDecimal = true
 			}
-			numStr += string(c)
-		} else if numStr != "" {
+
+			if !done {
+				messages = append(messages, map[string]interface{}{
+					"role":         "tool",
+					"tool_call_id": tc.ID,
+					"content":      resultContent,
+				})
+			}
+		}
+
+		if done {
 			break
 		}
 	}
 
-	if numStr == "" {
-		return 0
-	}
-
-	var num float64
-	_, err := fmt.Sscanf(numStr, "%f", &num)
-	if err != nil {
-		return 0
-	}
-	return num
+	return &Message{
+		Role:      "assistant",
+		Content:   finalContent.String(),
+		Timestamp: time.Now(),
+	}, nil
 }
 
-// buildLLMRequest 构建 LLM 请求
+// ── skill-server HTTP client ──────────────────────────────────────────────────
+
+type skillServerExecuteResp struct {
+	Success    bool                   `json:"success"`
+	Result     map[string]interface{} `json:"result,omitempty"`
+	ActionType string                 `json:"action_type"`
+	Message    string                 `json:"message,omitempty"`
+	NextTool   string                 `json:"next_tool,omitempty"`
+	Error      string                 `json:"error,omitempty"`
+}
+
+func (a *Agent) getSkillsFromServer(ctx context.Context, pageContext string) ([]map[string]interface{}, error) {
+	log := logger.FromContext(ctx)
+	url := a.skillServerURL + "/skills"
+	if pageContext != "" {
+		url += "?page_context=" + pageContext
+	}
+
+	log.Infof("[skill-server] GET %s", url)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if traceID := logger.IDFromContext(ctx); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		log.Errorf("[skill-server] GET %s error: %v", url, err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Tools []map[string]interface{} `json:"tools"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+
+	toolNames := make([]string, 0, len(body.Tools))
+	for _, t := range body.Tools {
+		if fn, ok := t["function"].(map[string]interface{}); ok {
+			toolNames = append(toolNames, fmt.Sprintf("%v", fn["name"]))
+		}
+	}
+	log.Infof("[skill-server] GET %s → %d tools: %v", url, len(body.Tools), toolNames)
+
+	return body.Tools, nil
+}
+
+func (a *Agent) executeToolOnServer(ctx context.Context, toolName, userID string, args map[string]interface{}) (*skillServerExecuteResp, error) {
+	log := logger.FromContext(ctx)
+	payload, err := json.Marshal(map[string]interface{}{
+		"tool_name": toolName,
+		"user_id":   userID,
+		"args":      args,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Infof("[skill-server] POST /execute tool=%s user=%s args=%s", toolName, userID, string(payload))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.skillServerURL+"/execute", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if traceID := logger.IDFromContext(ctx); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		log.Errorf("[skill-server] POST /execute tool=%s error: %v", toolName, err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result skillServerExecuteResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	resultJSON, _ := json.Marshal(result)
+	log.Infof("[skill-server] POST /execute tool=%s → success=%v action=%s result=%s",
+		toolName, result.Success, result.ActionType, string(resultJSON))
+
+	return &result, nil
+}
+
+// ── LLM helpers ───────────────────────────────────────────────────────────────
+
+// buildSystemPrompt builds the system prompt with memory context.
+// Tool descriptions are NOT included here — they're passed via the LLM `tools` field.
+func (a *Agent) buildSystemPrompt(state *AgentState) string {
+	var sb strings.Builder
+	sb.WriteString("You are an AI assistant for 咔皮记账 (KaPi Accounting). Help users manage their finances.\n\n")
+	sb.WriteString("Today's date: " + time.Now().Format("2006-01-02") + "\n\n")
+
+	if state.Memory.Profile != "" {
+		sb.WriteString("[用户画像]\n" + state.Memory.Profile + "\n\n")
+	}
+	if state.Memory.Preferences != "" {
+		sb.WriteString("[偏好]\n" + state.Memory.Preferences + "\n\n")
+	}
+	if len(state.Memory.Facts) > 0 {
+		sb.WriteString("[关键事实]\n")
+		for _, fact := range state.Memory.Facts {
+			sb.WriteString("- " + fact + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	if state.Memory.RecentSummary != "" {
+		sb.WriteString("[近期对话摘要]\n" + state.Memory.RecentSummary + "\n\n")
+	}
+	sb.WriteString("Current Page: " + state.PageContext + "\n")
+	return sb.String()
+}
+
+// buildLLMRequest constructs the base LLM API request body
 func (a *Agent) buildLLMRequest(messages []map[string]interface{}, stream bool) map[string]interface{} {
 	return map[string]interface{}{
 		"model":       a.config.ModelName,
@@ -754,159 +448,63 @@ func (a *Agent) buildLLMRequest(messages []map[string]interface{}, stream bool) 
 	}
 }
 
-// callLLMForParameterExtraction 调用 LLM 提取参数（非流式）
-func (a *Agent) callLLMForParameterExtraction(ctx context.Context, prompt string, schema string) (map[string]interface{}, error) {
-	// 构建请求
-	messages := []map[string]interface{}{
-		{
-			"role":    "system",
-			"content": "你是一个参数提取助手。请根据用户输入和给定的 Schema 提取参数，返回纯 JSON 格式，不要包含 markdown 代码块标记。",
-		},
-		{
-			"role":    "user",
-			"content": fmt.Sprintf("用户输入：%s\n\nSchema：\n%s\n\n请提取参数并返回纯 JSON。", prompt, schema),
-		},
-	}
-
-	req := map[string]interface{}{
-		"model":       a.config.ModelName,
-		"messages":    messages,
-		"max_tokens":  2000,
-		"temperature": 0,
-		"stream":      false,
-	}
-
-	reqBody, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	a.logger.WithField("request", string(reqBody)).Info("Sending parameter extraction request to LLM")
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.config.LLMEndpoint, strings.NewReader(string(reqBody)))
-	if err != nil {
-		return nil, err
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.config.LLMApiKey)
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("LLM API returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	type LLMChoice struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	}
-
-	type LLMResponse struct {
-		Choices []LLMChoice `json:"choices"`
-		Error   *struct {
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-
-	var llmResp LLMResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return nil, err
-	}
-
-	if llmResp.Error != nil {
-		return nil, fmt.Errorf("LLM API error: %s", llmResp.Error.Message)
-	}
-
-	if len(llmResp.Choices) == 0 {
-		return nil, fmt.Errorf("no choices in LLM response")
-	}
-
-	rawContent := llmResp.Choices[0].Message.Content
-	a.logger.WithField("response", rawContent).Info("Received LLM response for parameter extraction")
-
-	// 清理可能存在的 markdown 代码块标记
-	cleanedContent := strings.TrimSpace(rawContent)
-	if strings.HasPrefix(cleanedContent, "```") {
-		// 去掉第一行 ```json 或 ```
-		lines := strings.SplitN(cleanedContent, "\n", 2)
-		if len(lines) > 1 {
-			cleanedContent = lines[1]
-			// 去掉结尾的 ```
-			if idx := strings.LastIndex(cleanedContent, "```"); idx != -1 {
-				cleanedContent = cleanedContent[:idx]
-			}
-			cleanedContent = strings.TrimSpace(cleanedContent)
-		}
-	}
-
-	if cleanedContent != rawContent {
-		a.logger.WithField("cleaned_response", cleanedContent).Info("Cleaned markdown from LLM response")
-	}
-
-	// 解析 JSON 内容
-	var params map[string]interface{}
-	if err := json.Unmarshal([]byte(cleanedContent), &params); err != nil {
-		return nil, fmt.Errorf("failed to parse LLM response as JSON: %w", err)
-	}
-
-	return params, nil
-}
-
-// callLLMStreamInternal 内部调用 LLM（流式）
+// callLLMStreamInternal sends a streaming request to the LLM, forwards text chunks to
+// streamChan, and returns the accumulated full content and any tool calls.
 func (a *Agent) callLLMStreamInternal(ctx context.Context, req map[string]interface{}, streamChan chan<- streaming.StreamEvent, sessionID string) (string, []ToolCall, error) {
-	// 创建请求
+	log := logger.FromContext(ctx)
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return "", nil, err
 	}
+	msgCount := 0
+	if msgs, ok := req["messages"].([]map[string]interface{}); ok {
+		msgCount = len(msgs)
+	}
+	toolCount := 0
+	if tools, ok := req["tools"].([]map[string]interface{}); ok {
+		toolCount = len(tools)
+	}
+	log.WithFields(logrus.Fields{
+		"session_id":    sessionID,
+		"model":         req["model"],
+		"endpoint":      a.config.LLMEndpoint,
+		"message_count": msgCount,
+		"tools_count":   toolCount,
+	}).Info("[llm] sending request")
+	log.WithField("session_id", sessionID).Debugf("[llm] request body: %s", string(reqBody))
 
-	// 打印 LLM 请求
-	a.logger.WithFields(logrus.Fields{
-		"model":    req["model"],
-		"messages": req["messages"],
-	}).Info("Sending LLM stream request")
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.config.LLMEndpoint, strings.NewReader(string(reqBody)))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.config.LLMEndpoint, strings.NewReader(string(reqBody)))
 	if err != nil {
 		return "", nil, err
 	}
-
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+a.config.LLMApiKey)
 
-	a.logger.Infof("[LLM Request] %s - Session:%s - Sending to: %s", time.Now().Format("15:04:05.000"), sessionID, a.config.LLMEndpoint)
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(httpReq)
+	resp, err := a.httpClient.Do(httpReq)
 	if err != nil {
 		return "", nil, err
 	}
 	defer resp.Body.Close()
 
-	a.logger.Infof("[LLM Response] %s - Session:%s - Status: %d", time.Now().Format("15:04:05.000"), sessionID, resp.StatusCode)
+	log.WithFields(logrus.Fields{
+		"session_id": sessionID,
+		"status":     resp.StatusCode,
+	}).Info("[llm] response received")
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", nil, fmt.Errorf("LLM API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// 解析 SSE 流
-	scanner := bufio.NewScanner(resp.Body)
-	var fullContent strings.Builder
-	var toolCalls []ToolCall
-	toolCallMap := make(map[int]*ToolCall)
+	// tcAccum accumulates streaming tool_call fragments before final parse
+	type tcAccum struct {
+		ID          string
+		FuncName    string
+		ArgsBuilder strings.Builder
+	}
 
 	type StreamChoice struct {
 		Delta struct {
-			Role      string `json:"role"`
 			Content   string `json:"content"`
 			ToolCalls []struct {
 				Index    int    `json:"index"`
@@ -920,317 +518,177 @@ func (a *Agent) callLLMStreamInternal(ctx context.Context, req map[string]interf
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	}
-
-	type StreamUsage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	}
-
 	type StreamResponse struct {
 		Choices []StreamChoice `json:"choices"`
-		Usage   StreamUsage    `json:"usage,omitempty"`
-		Error   *struct {
+		Usage   struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage,omitempty"`
+		Error *struct {
 			Message string `json:"message"`
 		} `json:"error,omitempty"`
 	}
 
+	scanner := bufio.NewScanner(resp.Body)
+	var fullContent strings.Builder
+	tcMap := make(map[int]*tcAccum)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "" || data == "[DONE]" {
-			a.logger.Infof("[LLM Stream] %s - Session:%s - [DONE]", time.Now().Format("15:04:05.000"), sessionID)
 			continue
 		}
 
-		// Log raw LLM response with timestamp
-		a.logger.Infof("[LLM Stream] %s - Session:%s - %s", time.Now().Format("15:04:05.000"), sessionID, data)
+		log.WithField("session_id", sessionID).Debugf("[llm] stream chunk: %s", data)
 
-		var streamResp StreamResponse
-		if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
+		var chunk StreamResponse
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			return "", nil, fmt.Errorf("LLM API error: %s", chunk.Error.Message)
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			streamChan <- streaming.StreamEvent{Type: streaming.TextEvent, TokenUsage: chunk.Usage.TotalTokens}
+		}
+		if len(chunk.Choices) == 0 {
 			continue
 		}
 
-		if streamResp.Error != nil {
-			return "", nil, fmt.Errorf("LLM API error: %s", streamResp.Error.Message)
+		delta := chunk.Choices[0].Delta
+		if delta.Content != "" {
+			fullContent.WriteString(delta.Content)
+			streamChan <- streaming.StreamEvent{Type: streaming.TextEvent, Content: delta.Content}
 		}
 
-		// Check for token usage and send it to client
-		if streamResp.Usage.TotalTokens > 0 {
-			streamChan <- streaming.StreamEvent{
-				Type:       streaming.TextEvent,
-				Content:    "",
-				TokenUsage: streamResp.Usage.TotalTokens,
+		// Accumulate raw argument strings; parse once after [DONE]
+		for _, tc := range delta.ToolCalls {
+			acc, ok := tcMap[tc.Index]
+			if !ok {
+				acc = &tcAccum{}
+				tcMap[tc.Index] = acc
 			}
-		}
-
-		if len(streamResp.Choices) > 0 {
-			delta := streamResp.Choices[0].Delta
-			if delta.Content != "" {
-				fullContent.WriteString(delta.Content)
-				streamChan <- streaming.StreamEvent{
-					Type:    streaming.TextEvent,
-					Content: delta.Content,
-				}
+			if tc.ID != "" {
+				acc.ID = tc.ID
 			}
-
-			// Handle tool calls in delta
-			for _, tc := range delta.ToolCalls {
-				call, exists := toolCallMap[tc.Index]
-				if !exists {
-					call = &ToolCall{
-						ID:   tc.ID,
-						Type: tc.Type,
-						Function: ToolFunction{
-							Name:      tc.Function.Name,
-							Arguments: make(map[string]interface{}),
-						},
-					}
-					toolCallMap[tc.Index] = call
-				}
-
-				if tc.ID != "" {
-					call.ID = tc.ID
-				}
-				if tc.Type != "" {
-					call.Type = tc.Type
-				}
-				if tc.Function.Name != "" {
-					call.Function.Name = tc.Function.Name
-				}
-				if tc.Function.Arguments != "" {
-					var args map[string]interface{}
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
-						for k, v := range args {
-							call.Function.Arguments[k] = v
-						}
-					}
-				}
+			if tc.Function.Name != "" {
+				acc.FuncName = tc.Function.Name
 			}
+			acc.ArgsBuilder.WriteString(tc.Function.Arguments)
 		}
 	}
 
-	// Convert tool call map to slice in order
-	for i := 0; i < len(toolCallMap); i++ {
-		if call, exists := toolCallMap[i]; exists {
-			toolCalls = append(toolCalls, *call)
+	// Assemble ToolCall slice in index order
+	toolCalls := make([]ToolCall, 0, len(tcMap))
+	for i := 0; i < len(tcMap); i++ {
+		acc, ok := tcMap[i]
+		if !ok {
+			continue
 		}
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(acc.ArgsBuilder.String()), &args); err != nil {
+			args = make(map[string]interface{})
+		}
+		toolCalls = append(toolCalls, ToolCall{
+			ID:   acc.ID,
+			Type: "function",
+			Function: ToolFunction{
+				Name:      acc.FuncName,
+				Arguments: args,
+			},
+		})
 	}
 
-	// 打印 LLM 响应
-	a.logger.WithFields(logrus.Fields{
-		"content_length":   len(fullContent.String()),
+	log.WithFields(logrus.Fields{
+		"session_id":       sessionID,
+		"content_length":   fullContent.Len(),
 		"tool_calls_count": len(toolCalls),
 		"content":          fullContent.String(),
-	}).Info("Received LLM stream response")
+	}).Info("[llm] stream complete")
 
 	return fullContent.String(), toolCalls, nil
 }
 
-// formatDataForLLM 格式化数据供 LLM 理解（不包含用户敏感信息）
-func (a *Agent) formatDataForLLM(data map[string]interface{}) string {
-	var sb strings.Builder
+// ── Step event helpers ────────────────────────────────────────────────────────
 
-	// 调试：打印原始数据
-	a.logger.WithField("raw_data", data).Debug("Formatting data for LLM")
-
-	// 处理账单查询结果 - 支持多种类型，过滤敏感信息
-	billsValue, hasBills := data["bills"]
-	if hasBills {
-		switch bills := billsValue.(type) {
-		case []interface{}:
-			if len(bills) > 0 {
-				sb.WriteString("账单记录：\n")
-				for i, bill := range bills {
-					if billMap, ok := bill.(map[string]interface{}); ok {
-						// 格式化时间戳，只保留日期
-						timestamp, _ := billMap["timestamp"].(string)
-						timestamp = formatTimestamp(timestamp)
-						category, _ := billMap["category"].(string)
-						amount, _ := billMap["amount"].(float64)
-						description, _ := billMap["description"].(string)
-						sb.WriteString(fmt.Sprintf("%d. %s %s %.2f元", i+1, timestamp, category, amount))
-						if description != "" {
-							sb.WriteString(fmt.Sprintf(" (%s)", description))
-						}
-						sb.WriteString("\n")
-					}
-				}
-			}
-		case []map[string]interface{}:
-			if len(bills) > 0 {
-				sb.WriteString("账单记录：\n")
-				for i, bill := range bills {
-					// 格式化时间戳，只保留日期
-					timestamp, _ := bill["timestamp"].(string)
-					timestamp = formatTimestamp(timestamp)
-					category, _ := bill["category"].(string)
-					amount, _ := bill["amount"].(float64)
-					description, _ := bill["description"].(string)
-					sb.WriteString(fmt.Sprintf("%d. %s %s %.2f元", i+1, timestamp, category, amount))
-					if description != "" {
-						sb.WriteString(fmt.Sprintf(" (%s)", description))
-					}
-					sb.WriteString("\n")
-				}
-			}
-		}
-	}
-
-	// 处理汇总信息
-	if summaryValue, hasSummary := data["summary"]; hasSummary {
-		switch summary := summaryValue.(type) {
-		case map[string]interface{}:
-			if totalAmount, ok := summary["total_amount"].(float64); ok {
-				sb.WriteString(fmt.Sprintf("\n总金额：%.2f元\n", totalAmount))
-			}
-			if totalCount, ok := summary["total_count"].(int); ok {
-				sb.WriteString(fmt.Sprintf("总笔数：%d\n", totalCount))
-			}
-			if byCategory, ok := summary["by_category"].(map[string]interface{}); ok {
-				sb.WriteString("\n分类统计：\n")
-				for category, amount := range byCategory {
-					if amt, ok := amount.(float64); ok {
-						sb.WriteString(fmt.Sprintf("  %s: %.2f元\n", category, amt))
-					}
-				}
-			}
-		}
-	}
-
-	// 处理其他字段
-	if total, ok := data["total"].(int); ok {
-		sb.WriteString(fmt.Sprintf("\n总记录数：%d\n", total))
-	}
-
-	// 处理成功/失败消息
-	if message, ok := data["message"].(string); ok && message != "" {
-		sb.WriteString(fmt.Sprintf("\n系统消息：%s\n", message))
-	}
-
-	// 如果什么都没输出，输出原始数据用于调试
-	if sb.Len() == 0 {
-		a.logger.Warn("No data formatted, outputting raw data")
-		dataJSON, _ := json.MarshalIndent(data, "", "  ")
-		return string(dataJSON)
-	}
-
-	return sb.String()
-}
-
-// generateResponseFromDataStreaming 流式生成自然语言回复
-func (a *Agent) generateResponseFromDataStreaming(ctx context.Context, userQuery string, data map[string]interface{}, streamChan chan<- streaming.StreamEvent) {
-	// 将数据序列化为 JSON 再解析，统一类型
-	dataJSON, err := json.Marshal(data)
-	if err != nil {
-		streamChan <- streaming.StreamEvent{
-			Type:    streaming.ErrorEvent,
-			Content: "数据格式错误",
-		}
-		return
-	}
-	var unifiedData map[string]interface{}
-	if err := json.Unmarshal(dataJSON, &unifiedData); err != nil {
-		streamChan <- streaming.StreamEvent{
-			Type:    streaming.ErrorEvent,
-			Content: "数据解析错误",
-		}
-		return
-	}
-
-	// 构建更友好的数据展示格式
-	dataDisplay := a.formatDataForLLM(unifiedData)
-
-	// 构建请求（流式）
-	messages := []map[string]interface{}{
-		{
-			"role":    "system",
-			"content": "你是咔皮记账的 AI 助手。根据用户的问题和查询结果，用自然语言回答用户。",
-		},
-		{
-			"role":    "user",
-			"content": fmt.Sprintf("用户问题：%s\n\n查询结果：\n%s\n\n请根据查询结果用自然语言回答用户的问题。", userQuery, dataDisplay),
-		},
-	}
-
-	req := map[string]interface{}{
-		"model":       a.config.ModelName,
-		"messages":    messages,
-		"max_tokens":  2000,
-		"temperature": 0.7,
-		"stream":      true,
-	}
-
-	// 调用流式 LLM
-	reqBody, _ := json.Marshal(req)
-	httpReq, _ := http.NewRequestWithContext(ctx, "POST", a.config.LLMEndpoint, strings.NewReader(string(reqBody)))
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.config.LLMApiKey)
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		streamChan <- streaming.StreamEvent{
-			Type:    streaming.ErrorEvent,
-			Content: "调用 LLM 失败",
-		}
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		streamChan <- streaming.StreamEvent{
-			Type:    streaming.ErrorEvent,
-			Content: fmt.Sprintf("LLM 错误: %d", resp.StatusCode),
-		}
-		return
-	}
-
-	// 解析 SSE 流并流式发送
-	scanner := bufio.NewScanner(resp.Body)
-	type StreamChoice struct {
-		Delta struct {
-			Content string `json:"content"`
-		} `json:"delta"`
-	}
-	type StreamResponse struct {
-		Choices []StreamChoice `json:"choices"`
-	}
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "" || data == "[DONE]" {
-			continue
-		}
-
-		var streamResp StreamResponse
-		if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
-			continue
-		}
-
-		if len(streamResp.Choices) > 0 && streamResp.Choices[0].Delta.Content != "" {
-			streamChan <- streaming.StreamEvent{
-				Type:    streaming.TextEvent,
-				Content: streamResp.Choices[0].Delta.Content,
-			}
-		}
+func stepStartMsg(toolName string) string {
+	switch toolName {
+	case "add_bill":
+		return "正在记录账单..."
+	case "query_bills":
+		return "正在查询账单..."
+	case "query_budget":
+		return "正在查询预算..."
+	case "update_budget":
+		return "正在更新预算..."
+	default:
+		return fmt.Sprintf("正在执行 %s...", toolName)
 	}
 }
 
-// saveSession saves the current conversation to the session
+func stepDoneMsg(toolName string, result map[string]interface{}) string {
+	switch toolName {
+	case "query_bills":
+		if count, ok := result["count"].(float64); ok {
+			return fmt.Sprintf("查询到 %d 条账单", int(count))
+		}
+		return "账单查询完成"
+	case "query_budget":
+		if budgets, ok := result["budgets"].([]interface{}); ok {
+			return fmt.Sprintf("已获取 %d 个分类预算数据", len(budgets))
+		}
+		return "预算查询完成"
+	case "update_budget":
+		cat, _ := result["category"].(string)
+		if amt, ok := result["new_amount"].(float64); ok && cat != "" {
+			return fmt.Sprintf("%s 预算已更新为 %.0f 元", cat, amt)
+		}
+		return "预算更新完成"
+	default:
+		return "执行完成"
+	}
+}
+
+// ── Fallback & persistence ────────────────────────────────────────────────────
+
+// getMockResponse returns a keyword-matched reply when the LLM is unreachable
+func (a *Agent) getMockResponse(state *AgentState, streamChan chan<- streaming.StreamEvent) *Message {
+	userMessage := ""
+	for i := len(state.MessageHistory) - 1; i >= 0; i-- {
+		if state.MessageHistory[i].Role == "user" {
+			userMessage = state.MessageHistory[i].Content
+			break
+		}
+	}
+
+	content := "抱歉，我现在无法连接到 AI 服务。请稍后再试。"
+	switch {
+	case strings.Contains(userMessage, "记账") || strings.Contains(userMessage, "花费") || strings.Contains(userMessage, "支出"):
+		content = "我帮您记录这笔支出。请问您想记录什么金额？"
+	case strings.Contains(userMessage, "查询") || strings.Contains(userMessage, "账单") || strings.Contains(userMessage, "记录"):
+		content = "我可以帮您查询账单记录。请告诉我您想查询的时间范围。"
+	case strings.Contains(userMessage, "预算") || strings.Contains(userMessage, "理财") || strings.Contains(userMessage, "存钱"):
+		content = "关于预算建议，建议您按照 50/30/20 法则。您想了解哪方面的预算建议？"
+	case strings.Contains(userMessage, "你好") || strings.Contains(userMessage, "hello"):
+		content = "您好！我是您的财务助手，有什么可以帮您？"
+	}
+
+	for _, ch := range []rune(content) {
+		if streamChan != nil {
+			streamChan <- streaming.StreamEvent{Type: streaming.TextEvent, Content: string(ch)}
+		}
+	}
+
+	return &Message{Role: "assistant", Content: content, Timestamp: time.Now()}
+}
+
+// saveSession persists the current turn to the session store
 func (a *Agent) saveSession(state *AgentState, response *Message) {
 	sess, err := a.sessionManager.GetSession(state.SessionID)
 	if err != nil {
-		// Session doesn't exist, create a new one
 		sessionID, err := a.sessionManager.GetOrCreateSession(state.UserID)
 		if err != nil {
 			a.logger.WithError(err).Warn("Failed to create session")
@@ -1240,7 +698,6 @@ func (a *Agent) saveSession(state *AgentState, response *Message) {
 		sess, _ = a.sessionManager.GetSession(sessionID)
 	}
 
-	// Add user and assistant messages to session
 	now := time.Now().UTC().Format(time.RFC3339)
 	sess.Messages = append(sess.Messages, map[string]interface{}{
 		"role":      "user",

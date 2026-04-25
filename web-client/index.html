@@ -106,6 +106,36 @@
             font-style: italic;
         }
 
+        /* Step indicator — lives as the first line inside the assistant bubble */
+        .step-line {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11.5px;
+            color: #999;
+            font-style: italic;
+            font-family: 'SF Mono', 'Menlo', Consolas, monospace;
+            padding-bottom: 6px;
+            margin-bottom: 6px;
+            border-bottom: 1px solid rgba(0,0,0,0.07);
+        }
+
+        .step-line::before {
+            content: '';
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border: 1.5px solid #bbb;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            flex-shrink: 0;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
         .error {
             color: #dc3545;
             background: #f8d7da;
@@ -134,11 +164,12 @@
         <div class="page-selector">
             <label for="pageContext">当前页面:</label>
             <select id="pageContext">
-                <option value="home">首页</option>
-                <option value="add_bill">记一笔</option>
-                <option value="query_bills">账单详情</option>
-                <!-- <option value="budget">预算</option>
-                <option value="assets">资产管理</option> -->
+                <option value="home">首页（记账+账单查询）</option>
+                <option value="bills.add">记一笔（记账）</option>
+                <option value="bills.list">账单列表（账单查询）</option>
+                <option value="bills.detail">账单详情（账单查询）</option>
+                <option value="budget.index">预算总览（预算助手）</option>
+                <option value="budget.detail">预算详情（预算助手）</option>
             </select>
         </div>
 
@@ -244,6 +275,8 @@
                 let assistantMessage = '';
                 let isComplete = false;
                 let messageDiv = null;
+                let stepLine = null;  // single step-indicator line inside messageDiv
+                let textStarted = false;
 
                 while (!isComplete) {
                     const { done, value } = await reader.read();
@@ -267,24 +300,44 @@
                                     console.log('收到事件:', event.type, event.content);
 
                                     if (event.type === 'start') {
-                                        // 流式开始，移除 loading，创建消息容器
                                         loadingDiv.remove();
                                         messageDiv = document.createElement('div');
                                         messageDiv.className = 'message assistant-message';
                                         document.getElementById('chatContainer').appendChild(messageDiv);
-                                    } else if (event.type === 'text' && event.content) {
-                                        // 流式文本内容
-                                        assistantMessage += event.content;
-                                        if (messageDiv) {
-                                            messageDiv.textContent = assistantMessage;
+
+                                    } else if (event.type === 'step') {
+                                        // 确保 messageDiv 存在（start 事件先到，这里是保险）
+                                        if (!messageDiv) {
+                                            loadingDiv.remove();
+                                            messageDiv = document.createElement('div');
+                                            messageDiv.className = 'message assistant-message';
+                                            document.getElementById('chatContainer').appendChild(messageDiv);
                                         }
-                                        // 自动滚动到底部
-                                        document.getElementById('chatContainer').scrollTop = document.getElementById('chatContainer').scrollHeight;
+                                        // 在 bubble 顶部创建 / 原地替换步骤指示行
+                                        if (!stepLine) {
+                                            stepLine = document.createElement('div');
+                                            stepLine.className = 'step-line';
+                                            messageDiv.insertBefore(stepLine, messageDiv.firstChild);
+                                        }
+                                        stepLine.textContent = event.content;
+                                        document.getElementById('chatContainer').scrollTop =
+                                            document.getElementById('chatContainer').scrollHeight;
+
+                                    } else if (event.type === 'text' && event.content) {
+                                        // 首条实际文本来临，移除步骤指示行
+                                        if (stepLine) { stepLine.remove(); stepLine = null; }
+                                        textStarted = true;
+                                        assistantMessage += event.content;
+                                        if (messageDiv) messageDiv.textContent = assistantMessage;
+                                        document.getElementById('chatContainer').scrollTop =
+                                            document.getElementById('chatContainer').scrollHeight;
+
                                     } else if (event.type === 'error') {
-                                        // 错误事件
+                                        if (stepLine) { stepLine.remove(); stepLine = null; }
                                         addError(event.content);
+
                                     } else if (event.type === 'done') {
-                                        // 流式结束，重新启用输入
+                                        if (stepLine) { stepLine.remove(); stepLine = null; }
                                         isStreaming = false;
                                         document.getElementById('messageInput').disabled = false;
                                         document.getElementById('sendButton').disabled = false;

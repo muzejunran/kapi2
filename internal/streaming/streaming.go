@@ -11,6 +11,7 @@ type EventType string
 const (
 	StartEvent EventType = "start"
 	TextEvent  EventType = "text"
+	StepEvent  EventType = "step" // 中间步骤，不存历史
 	DoneEvent  EventType = "done"
 	ErrorEvent EventType = "error"
 )

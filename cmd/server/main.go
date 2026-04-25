@@ -12,13 +12,11 @@ import (
 	"ai-assistant-service/internal/agent"
 	"ai-assistant-service/internal/api"
 	"ai-assistant-service/internal/config"
-	"ai-assistant-service/internal/llm"
+	"ai-assistant-service/internal/logger"
 	"ai-assistant-service/internal/memory"
 	"ai-assistant-service/internal/model"
-	"ai-assistant-service/internal/plugin"
 	"ai-assistant-service/internal/repository"
 	"ai-assistant-service/internal/session"
-	"ai-assistant-service/internal/skill"
 	"ai-assistant-service/internal/storage"
 
 	"github.com/gorilla/mux"
@@ -26,21 +24,17 @@ import (
 )
 
 func main() {
+	// Setup structured logger (level + timestamp + file:line) before anything else
+	logger.Setup()
+
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		stdlog.Fatalf("Failed to load config: %v", err)
 	}
 
-	// 运行模式配置（容器内固定生产模式）
-	cfg.SkillsDir = ""
-	cfg.SkillsBinDir = "skills"
-	stdlog.Println("Running in production mode")
-
-	// Setup logger
-	logger := logrus.New()
-	logger.SetFormatter(&logrus.JSONFormatter{})
-	logger.SetOutput(os.Stdout)
+	log := logger.New()
+	log.SetOutput(os.Stdout)
 
 	// Initialize storage (Redis)
 	redisStorage := storage.NewRedisStorage(cfg.RedisAddr)
@@ -51,6 +45,7 @@ func main() {
 	// Initialize conversation repository (如果MySQL DSN为空，则不使用数据库)
 	var convRepo *repository.ConversationRepository
 	var billRepo *repository.BillRepository
+	var memRepo *repository.MemoryRepository
 
 	if cfg.MySQLDSN != "" {
 		convRepo, err = repository.NewConversationRepository(cfg.MySQLDSN)
@@ -65,149 +60,73 @@ func main() {
 		}
 		defer billRepo.Close()
 
-		logger.Info("MySQL repositories initialized")
+		memRepo, err = repository.NewMemoryRepository(cfg.MySQLDSN)
+		if err != nil {
+			log.WithError(err).Warn("Failed to create memory repository, memory won't be persisted to MySQL")
+			memRepo = nil
+		} else {
+			defer memRepo.Close()
+		}
+
+		log.Info("MySQL repositories initialized")
 	} else {
-		logger.Info("MySQL DSN not configured, using in-memory storage only")
-		convRepo = nil
-		billRepo = nil
+		log.Info("MySQL DSN not configured, using in-memory storage only")
 	}
 
 	// Initialize memory service
 	memoryService := memory.NewMemoryService(redisStorage, cfg.TokenBudget)
 
-	// Set database callbacks for memory service
-	memoryService.SetDatabaseCallbacks(
-		func(userID string, limit int) ([]memory.ConversationTurn, error) {
-			// Load from MySQL
-			if convRepo == nil {
-				return []memory.ConversationTurn{}, nil
-			}
-			convs, dbErr := convRepo.GetRecentMessages(userID, limit)
-			if dbErr != nil {
-				return nil, dbErr
-			}
-
-			// Convert to ConversationTurn pairs
-			turns := make([]memory.ConversationTurn, 0)
-			for i := 0; i < len(convs); i += 2 {
-				turn := memory.ConversationTurn{}
-				if i < len(convs) && convs[i].Role == "user" {
-					turn.UserMessage = convs[i].Content
-				}
-				if i+1 < len(convs) && convs[i+1].Role == "assistant" {
-					turn.AssistantMessage = convs[i+1].Content
-				}
-				if turn.UserMessage != "" || turn.AssistantMessage != "" {
-					turns = append(turns, turn)
-				}
-			}
-			return turns, nil
-		},
-		func(userID string, turn memory.ConversationTurn) error {
-			// Save to MySQL
-			if convRepo == nil {
-				return nil
-			}
-			now := time.Now()
-			if turn.UserMessage != "" {
-				if err := convRepo.AddMessage(&model.Conversation{
-					UserID:    userID,
-					Role:      "user",
-					Content:   turn.UserMessage,
-					CreatedAt: now.UTC().Format(time.RFC3339),
-				}); err != nil {
-					return err
-				}
-			}
-			if turn.AssistantMessage != "" {
-				if err := convRepo.AddMessage(&model.Conversation{
-					UserID:    userID,
-					Role:      "assistant",
-					Content:   turn.AssistantMessage,
-					CreatedAt: now.UTC().Format(time.RFC3339),
-				}); err != nil {
-					return err
-				}
-			}
+	// Set database save callback for conversation persistence
+	memoryService.SetDatabaseCallbacks(func(userID string, turn memory.ConversationTurn) error {
+		if convRepo == nil {
 			return nil
-		},
-	)
-	// Initialize tool registry
-	toolRegistry := skill.NewToolRegistry()
-	skillRegistry := skill.NewSkillRegistry()
-
-	// ========== 使用插件加载器加载 Skills ==========
-	// 创建 LLM 客户端（如果插件需要调用 LLM）
-	llmClient := llm.NewClient(cfg.LLMServicePort)
-
-	// 创建插件依赖
-	pluginDeps := &plugin.Dependencies{
-		LLMService: plugin.NewLLMServiceAdapter(llmClient),
-		BillRepo:   plugin.NewBillRepoAdapter(billRepo),
-	}
-
-	// 创建插件加载器
-	pluginLoader := plugin.NewLoader(cfg.SkillsDir, cfg.SkillsBinDir, pluginDeps, logger)
-
-	// 设置热加载回调
-	pluginLoader.OnReload = func(skillID string, skill plugin.Skill) {
-		// 适配插件 skill
-		adapter := plugin.NewPluginSkillAdapter(skill)
-		// 重新注册到 skillRegistry
-		if err := skillRegistry.RegisterSkill(adapter); err != nil {
-			logger.Warnf("Failed to re-register plugin skill %s: %v", adapter.GetID(), err)
-		} else {
-			logger.Infof("✓ Re-registered plugin skill: %s", adapter.GetID())
-			// 注册工具
-			for _, tool := range adapter.GetTools() {
-				toolRegistry.RegisterTool(tool)
+		}
+		now := time.Now()
+		if turn.UserMessage != "" {
+			if err := convRepo.AddMessage(&model.Conversation{
+				UserID:    userID,
+				Role:      "user",
+				Content:   turn.UserMessage,
+				CreatedAt: now.UTC().Format(time.RFC3339),
+			}); err != nil {
+				return err
 			}
 		}
-	}
-
-	// 加载所有插件
-	if err := pluginLoader.LoadAll(); err != nil {
-		logger.Warnf("Failed to load some plugins: %v", err)
-	}
-
-	// 将插件适配后注册到现有的 skillRegistry
-	for _, pluginSkill := range pluginLoader.GetAllSkills() {
-		adapter := plugin.NewPluginSkillAdapter(pluginSkill)
-		if err := skillRegistry.RegisterSkill(adapter); err != nil {
-			logger.Warnf("Failed to register plugin skill %s: %v", adapter.GetID(), err)
-		} else {
-			logger.Infof("✓ Registered plugin skill: %s", adapter.GetID())
-
-			// 注册工具
-			for _, tool := range adapter.GetTools() {
-				if err := toolRegistry.RegisterTool(tool); err != nil {
-					logger.Warnf("Failed to register tool %s: %v", tool.ID, err)
-				}
+		if turn.AssistantMessage != "" {
+			if err := convRepo.AddMessage(&model.Conversation{
+				UserID:    userID,
+				Role:      "assistant",
+				Content:   turn.AssistantMessage,
+				CreatedAt: now.UTC().Format(time.RFC3339),
+			}); err != nil {
+				return err
 			}
 		}
+		return nil
+	})
+
+	// Wire MySQL persistence for the Memory struct (load on cold-start, save on every update)
+	if memRepo != nil {
+		memoryService.SetMemoryPersistence(memRepo.Load, memRepo.Save, memRepo.Delete)
 	}
 
-	// 启动文件监听（热更新）
-	if err := pluginLoader.StartWatcher(); err != nil {
-		logger.Warnf("Failed to start file watcher: %v", err)
-	}
-
-	// Initialize tool executor
-	toolExecutor := skill.NewToolExecutor(cfg.SkillTimeout)
-
-	// Initialize agent
+	// Initialize memory determiner for async memory extraction
+	memDeterminer := memory.NewMemoryDeterminer(cfg.LLMEndpoint, cfg.LLMApiKey, cfg.ModelName)
+	memoryService.SetDeterminer(memDeterminer)
+	// Initialize agent (skills loaded via skill-server)
 	agentConfig := agent.AgentConfig{
-		LLMEndpoint:   cfg.LLMEndpoint,
-		LLMApiKey:     cfg.LLMApiKey,
-		ModelName:     cfg.ModelName,
-		MaxTokens:     cfg.MaxTokens,
-		Temperature:   cfg.Temperature,
-		StreamEnabled: true,
-		TokenBudget:   cfg.TokenBudget,
-		SkillTimeout:  cfg.SkillTimeout,
+		LLMEndpoint:    cfg.LLMEndpoint,
+		LLMApiKey:      cfg.LLMApiKey,
+		ModelName:      cfg.ModelName,
+		MaxTokens:      cfg.MaxTokens,
+		Temperature:    cfg.Temperature,
+		StreamEnabled:  true,
+		TokenBudget:    cfg.TokenBudget,
+		SkillTimeout:   cfg.SkillTimeout,
+		SkillServerURL: cfg.SkillServerURL,
 	}
 
-	aiAgent := agent.NewAgent(agentConfig, skillRegistry, toolRegistry, toolExecutor, memoryService, sessionManager, nil)
+	aiAgent := agent.NewAgent(agentConfig, memoryService, sessionManager, nil)
 
 	// Initialize API handler
 	apiHandler := api.NewAPIHandler(cfg, aiAgent, sessionManager, memoryService)
@@ -221,7 +140,8 @@ func main() {
 	// Serve static files
 	router.PathPrefix("/web-client/").Handler(http.StripPrefix("/web-client/", http.FileServer(http.Dir("web-client"))))
 
-	// Add middleware
+	// Add middleware (trace first so all downstream logs carry trace_id)
+	router.Use(traceMiddleware)
 	router.Use(loggingMiddleware)
 	router.Use(corsMiddleware)
 	router.Use(rateLimitMiddleware)
@@ -237,9 +157,9 @@ func main() {
 
 	// Start server
 	go func() {
-		logger.Infof("Server starting on port %s", cfg.ServerPort)
+		log.Infof("Server starting on port %s", cfg.ServerPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("Server failed: %v", err)
+			log.Fatalf("Server failed: %v", err)
 		}
 	}()
 
@@ -248,21 +168,33 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	<-quit
-	logger.Info("Shutting down server...")
+	log.Info("Shutting down server...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		logger.Printf("Server shutdown error: %v", err)
+		log.Errorf("Server shutdown error: %v", err)
 	}
 
-	logger.Info("Server stopped")
+	log.Info("Server stopped")
 }
 
-// wireSkillHandlers wires skill handlers to the registry
-
 // Middleware functions
+
+// traceMiddleware reads X-Trace-ID from the request (or generates one) and injects it into the context.
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-ID")
+		if traceID == "" {
+			traceID = logger.NewID()
+		}
+		w.Header().Set("X-Trace-ID", traceID)
+		ctx := logger.WithTraceID(r.Context(), traceID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

@@ -1,0 +1,46 @@
+{
+  "id": "budget_advisor",
+  "name": "预算助手",
+  "description": "查询和修改预算，提供预算分析建议",
+  "layer": "org",
+  "supported_pages": ["budget.index", "budget.detail"],
+  "tools": [
+    {
+      "name": "query_budget",
+      "description": "查询各分类当前预算设置及本月消费情况",
+      "action_type": "llm_summary",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "指定查询的分类，不填返回全部",
+            "enum": ["餐饮", "购物", "交通", "娱乐", "医疗", "其他"]
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "update_budget",
+      "description": "修改指定分类的预算金额，例如：'把娱乐预算调到800'",
+      "action_type": "llm_summary",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "要修改预算的分类",
+            "enum": ["餐饮", "购物", "交通", "娱乐", "医疗", "其他"]
+          },
+          "amount": {
+            "type": "number",
+            "description": "新的预算金额（元），必须大于0",
+            "minimum": 0.01
+          }
+        },
+        "required": ["category", "amount"]
+      }
+    }
+  ]
+}

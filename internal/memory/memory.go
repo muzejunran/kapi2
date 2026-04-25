@@ -1,15 +1,18 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
+	"ai-assistant-service/internal/logger"
 	"ai-assistant-service/internal/storage"
 	"github.com/sirupsen/logrus"
 )
 
-// ConversationTurn represents a single conversation turn (user + assistant)
+// ConversationTurn is kept for database persistence callbacks
 type ConversationTurn struct {
 	UserMessage      string `json:"user_message"`
 	AssistantMessage string `json:"assistant_message"`
@@ -17,130 +20,202 @@ type ConversationTurn struct {
 
 // Memory stores user-related information for context building
 type Memory struct {
-	UserID      string             `json:"user_id"`
-	Profile     string             `json:"profile"`
-	Preferences string             `json:"preferences"`
-	Facts       []string           `json:"facts"`
-	RecentTurns []ConversationTurn `json:"recent_turns"`
-	UpdatedAt   string             `json:"updated_at"`
+	UserID        string   `json:"user_id"`
+	Profile       string   `json:"profile"`
+	Preferences   string   `json:"preferences"`
+	Facts         []string `json:"facts"`
+	RecentSummary string   `json:"recent_summary"` // LLM-compressed rolling summary
+	UpdatedAt     string   `json:"updated_at"`
 }
 
 const (
-	memoryKeyPrefix     = "memory:"
-	memoryCacheTTL      = 24 * time.Hour
-	maxRecentTurns      = 30
-	maxContextTokens    = 4000
+	memoryKeyPrefix  = "memory:"
+	memoryCacheTTL   = 24 * time.Hour
+	maxSummaryTokens = 500
+	maxFacts         = 30
 )
+
+// addFactIfNew appends fact only if not already present (case-insensitive).
+// Evicts the oldest fact when at capacity.
+func addFactIfNew(facts []string, newFact string) []string {
+	newFact = strings.TrimSpace(newFact)
+	if newFact == "" {
+		return facts
+	}
+	for _, f := range facts {
+		if strings.EqualFold(f, newFact) {
+			return facts
+		}
+	}
+	if len(facts) >= maxFacts {
+		facts = facts[1:]
+	}
+	return append(facts, newFact)
+}
 
 // MemoryService manages user memory with Redis cache + MySQL persistence
 type MemoryService struct {
-	storage          *storage.RedisStorage
-	tokenBudget      int
-	logger           *logrus.Logger
-	dbLoadCallback   func(userID string, limit int) ([]ConversationTurn, error)
-	dbSaveCallback   func(userID string, turn ConversationTurn) error
+	storage           storage.KVStore
+	tokenBudget       int
+	logger            *logrus.Logger
+	determiner        *MemoryDeterminer
+	dbSaveCallback    func(userID string, turn ConversationTurn) error
+	memLoadCallback   func(userID string) (*Memory, error)
+	memSaveCallback   func(mem *Memory) error
+	memDeleteCallback func(userID string) error
 }
 
 // NewMemoryService creates a new memory service
-func NewMemoryService(redisStorage *storage.RedisStorage, tokenBudget int) *MemoryService {
+func NewMemoryService(store storage.KVStore, tokenBudget int) *MemoryService {
 	return &MemoryService{
-		storage:     redisStorage,
+		storage:     store,
 		tokenBudget: tokenBudget,
-		logger:      logrus.New(),
+		logger:      logger.New(),
 	}
 }
 
-// SetDatabaseCallbacks sets callbacks for database operations
-func (ms *MemoryService) SetDatabaseCallbacks(loadFunc func(userID string, limit int) ([]ConversationTurn, error), saveFunc func(userID string, turn ConversationTurn) error) {
-	ms.dbLoadCallback = loadFunc
+// SetDeterminer sets the memory determiner for async analysis
+func (ms *MemoryService) SetDeterminer(d *MemoryDeterminer) {
+	ms.determiner = d
+}
+
+// SetDatabaseCallbacks sets the save callback for conversation turn persistence
+func (ms *MemoryService) SetDatabaseCallbacks(saveFunc func(userID string, turn ConversationTurn) error) {
 	ms.dbSaveCallback = saveFunc
 }
 
-// GetUserMemory retrieves or creates user memory
+// SetMemoryPersistence wires MySQL load/save/delete for the Memory struct itself.
+// loadFn: called on Redis miss to restore from DB (return nil,nil if row not found).
+// saveFn: called after any in-memory update to persist the full snapshot.
+// deleteFn: called by ClearMemory to hard-delete the row.
+func (ms *MemoryService) SetMemoryPersistence(
+	loadFn func(userID string) (*Memory, error),
+	saveFn func(mem *Memory) error,
+	deleteFn func(userID string) error,
+) {
+	ms.memLoadCallback = loadFn
+	ms.memSaveCallback = saveFn
+	ms.memDeleteCallback = deleteFn
+}
+
+// GetUserMemory retrieves user memory: Redis (hot) → MySQL (warm) → empty (cold)
 func (ms *MemoryService) GetUserMemory(userID string) (*Memory, error) {
 	key := memoryKeyPrefix + userID
 
-	// Try to load from Redis cache
-	cached, err := ms.storage.Get(key)
-	if err == nil {
+	// 1. Redis hit
+	if cached, err := ms.storage.Get(key); err == nil {
 		var mem Memory
 		if err := json.Unmarshal(cached, &mem); err == nil {
-			ms.logger.WithField("user_id", userID).Debug("Memory loaded from cache")
+			ms.logger.WithField("user_id", userID).Debug("[memory] loaded from Redis cache")
 			return &mem, nil
 		}
 	}
 
-	// Load from database
-	turns := []ConversationTurn{}
-	if ms.dbLoadCallback != nil {
-		loadedTurns, dbErr := ms.dbLoadCallback(userID, maxRecentTurns)
+	// 2. MySQL fallback
+	if ms.memLoadCallback != nil {
+		dbMem, dbErr := ms.memLoadCallback(userID)
 		if dbErr != nil {
-			ms.logger.WithError(dbErr).Warn("Failed to load from database, using empty memory")
-		} else {
-			turns = loadedTurns
+			ms.logger.WithError(dbErr).Warn("[memory] failed to load from MySQL")
+		} else if dbMem != nil {
+			ms.logger.WithField("user_id", userID).Info("[memory] loaded from MySQL, warming Redis cache")
+			_ = ms.saveMemoryToCache(dbMem)
+			return dbMem, nil
 		}
 	}
 
-	// Create memory with existing turns
-	mem := ms.createMemoryWithTurns(userID, turns)
-
-	// Save to cache
-	if err := ms.saveMemoryToCache(mem); err != nil {
-		ms.logger.WithError(err).Warn("Failed to cache memory")
+	// 3. Brand-new user
+	ms.logger.WithField("user_id", userID).Info("[memory] no existing memory, creating empty")
+	mem := &Memory{
+		UserID:    userID,
+		Facts:     []string{},
+		UpdatedAt: time.Now().Format(time.RFC3339),
 	}
-
+	_ = ms.saveMemoryToCache(mem)
 	return mem, nil
 }
 
-// createMemoryWithTurns creates a new memory with existing conversation turns
-func (ms *MemoryService) createMemoryWithTurns(userID string, turns []ConversationTurn) *Memory {
-	return &Memory{
-		UserID:      userID,
-		Profile:     "",
-		Preferences: "",
-		Facts:       []string{},
-		RecentTurns: turns,
-		UpdatedAt:   time.Now().Format(time.RFC3339),
-	}
-}
-
-// AddConversationTurn adds a new conversation turn to memory
+// AddConversationTurn persists the turn and triggers async memory determination
 func (ms *MemoryService) AddConversationTurn(userID, userMsg, assistantMsg string) error {
-	// Get current memory
-	mem, err := ms.GetUserMemory(userID)
-	if err != nil {
-		return err
-	}
-
-	// Add new turn
-	turn := ConversationTurn{
-		UserMessage:      userMsg,
-		AssistantMessage: assistantMsg,
-	}
-
-	// Keep only recent turns
-	mem.RecentTurns = append(mem.RecentTurns, turn)
-	if len(mem.RecentTurns) > maxRecentTurns {
-		mem.RecentTurns = mem.RecentTurns[len(mem.RecentTurns)-maxRecentTurns:]
-	}
-	mem.UpdatedAt = time.Now().Format(time.RFC3339)
-
-	// Save to cache
-	if err := ms.saveMemoryToCache(mem); err != nil {
-		return err
-	}
-
-	// Save to database
 	if ms.dbSaveCallback != nil {
+		turn := ConversationTurn{UserMessage: userMsg, AssistantMessage: assistantMsg}
 		if dbErr := ms.dbSaveCallback(userID, turn); dbErr != nil {
-			ms.logger.WithError(dbErr).Warn("Failed to save to database")
+			ms.logger.WithError(dbErr).Warn("Failed to save turn to database")
 		}
 	}
+
+	if ms.determiner == nil {
+		return nil
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		result, err := ms.determiner.Analyze(ctx, userMsg, assistantMsg)
+		if err != nil {
+			ms.logger.WithError(err).Warn("Memory determination failed")
+			return
+		}
+
+		// Re-fetch latest memory to avoid overwriting concurrent updates
+		mem, err := ms.GetUserMemory(userID)
+		if err != nil {
+			ms.logger.WithError(err).Warn("Failed to reload memory for update")
+			return
+		}
+
+		if result.ProfileUpdate != nil && *result.ProfileUpdate != "" {
+			mem.Profile = *result.ProfileUpdate
+		}
+		if result.PreferenceUpdate != nil && *result.PreferenceUpdate != "" {
+			mem.Preferences = *result.PreferenceUpdate
+		}
+		for _, f := range result.NewFacts {
+			mem.Facts = addFactIfNew(mem.Facts, f)
+		}
+
+		if result.Summary != "" {
+			if mem.RecentSummary == "" {
+				mem.RecentSummary = result.Summary
+			} else {
+				combined := mem.RecentSummary + "\n" + result.Summary
+				if CalculateTokens(combined) > maxSummaryTokens {
+					compressed, compErr := ms.determiner.compressSummary(ctx, combined)
+					if compErr != nil {
+						ms.logger.WithError(compErr).Warn("Failed to compress summary")
+						mem.RecentSummary = combined
+					} else {
+						mem.RecentSummary = compressed
+					}
+				} else {
+					mem.RecentSummary = combined
+				}
+			}
+		}
+
+		mem.UpdatedAt = time.Now().Format(time.RFC3339)
+		if err := ms.saveMemoryToCache(mem); err != nil {
+			ms.logger.WithError(err).Warn("[memory] failed to save to Redis after determination")
+			return
+		}
+		if ms.memSaveCallback != nil {
+			if err := ms.memSaveCallback(mem); err != nil {
+				ms.logger.WithError(err).Warn("[memory] failed to persist to MySQL after determination")
+			}
+		}
+		ms.logger.WithFields(logrus.Fields{
+			"user_id":        userID,
+			"has_profile":    mem.Profile != "",
+			"has_prefs":      mem.Preferences != "",
+			"facts_count":    len(mem.Facts),
+			"summary_tokens": CalculateTokens(mem.RecentSummary),
+		}).Info("[memory] updated after determination")
+	}()
 
 	return nil
 }
 
-// UpdateProfile updates user profile in memory
+// UpdateProfile updates user profile in memory and persists to MySQL.
 func (ms *MemoryService) UpdateProfile(userID, profile string) error {
 	mem, err := ms.GetUserMemory(userID)
 	if err != nil {
@@ -148,10 +223,10 @@ func (ms *MemoryService) UpdateProfile(userID, profile string) error {
 	}
 	mem.Profile = profile
 	mem.UpdatedAt = time.Now().Format(time.RFC3339)
-	return ms.saveMemoryToCache(mem)
+	return ms.saveAndPersist(mem)
 }
 
-// UpdatePreferences updates user preferences in memory
+// UpdatePreferences updates user preferences in memory and persists to MySQL.
 func (ms *MemoryService) UpdatePreferences(userID, preferences string) error {
 	mem, err := ms.GetUserMemory(userID)
 	if err != nil {
@@ -159,21 +234,84 @@ func (ms *MemoryService) UpdatePreferences(userID, preferences string) error {
 	}
 	mem.Preferences = preferences
 	mem.UpdatedAt = time.Now().Format(time.RFC3339)
-	return ms.saveMemoryToCache(mem)
+	return ms.saveAndPersist(mem)
 }
 
-// AddFact adds a fact to user memory
+// AddFact appends a fact to user memory (deduped, capped at maxFacts) and persists.
 func (ms *MemoryService) AddFact(userID, fact string) error {
 	mem, err := ms.GetUserMemory(userID)
 	if err != nil {
 		return err
 	}
-	mem.Facts = append(mem.Facts, fact)
+	mem.Facts = addFactIfNew(mem.Facts, fact)
 	mem.UpdatedAt = time.Now().Format(time.RFC3339)
-	return ms.saveMemoryToCache(mem)
+	return ms.saveAndPersist(mem)
 }
 
-// saveMemoryToCache saves memory to Redis cache
+// RemoveFact removes a fact by index from user memory and persists to MySQL.
+func (ms *MemoryService) RemoveFact(userID string, index int) error {
+	mem, err := ms.GetUserMemory(userID)
+	if err != nil {
+		return err
+	}
+	if index < 0 || index >= len(mem.Facts) {
+		return fmt.Errorf("fact index %d out of range (0–%d)", index, len(mem.Facts)-1)
+	}
+	mem.Facts = append(mem.Facts[:index], mem.Facts[index+1:]...)
+	mem.UpdatedAt = time.Now().Format(time.RFC3339)
+	return ms.saveAndPersist(mem)
+}
+
+// TrimToBudget trims memory to fit within token budget.
+// Drop priority (lowest priority first): Profile → Preferences → Facts → RecentSummary
+func (ms *MemoryService) TrimToBudget(mem *Memory) *Memory {
+	if ms.CalculateContextTokens(mem) <= ms.tokenBudget {
+		return mem
+	}
+
+	trimmed := &Memory{
+		UserID:        mem.UserID,
+		Profile:       mem.Profile,
+		Preferences:   mem.Preferences,
+		Facts:         append([]string{}, mem.Facts...),
+		RecentSummary: mem.RecentSummary,
+		UpdatedAt:     mem.UpdatedAt,
+	}
+
+	if ms.CalculateContextTokens(trimmed) > ms.tokenBudget {
+		trimmed.Profile = ""
+	}
+	if ms.CalculateContextTokens(trimmed) > ms.tokenBudget {
+		trimmed.Preferences = ""
+	}
+	for ms.CalculateContextTokens(trimmed) > ms.tokenBudget && len(trimmed.Facts) > 0 {
+		trimmed.Facts = trimmed.Facts[1:]
+	}
+	if ms.CalculateContextTokens(trimmed) > ms.tokenBudget {
+		trimmed.RecentSummary = ""
+	}
+
+	ms.logger.WithFields(logrus.Fields{
+		"user_id":         mem.UserID,
+		"original_tokens": ms.CalculateContextTokens(mem),
+		"trimmed_tokens":  ms.CalculateContextTokens(trimmed),
+	}).Info("Memory trimmed to fit token budget")
+
+	return trimmed
+}
+
+// CalculateContextTokens calculates token count for all memory fields
+func (ms *MemoryService) CalculateContextTokens(mem *Memory) int {
+	total := CalculateTokens(mem.Profile) +
+		CalculateTokens(mem.Preferences) +
+		CalculateTokens(mem.RecentSummary)
+	for _, fact := range mem.Facts {
+		total += CalculateTokens(fact)
+	}
+	return total
+}
+
+// saveMemoryToCache writes memory to Redis.
 func (ms *MemoryService) saveMemoryToCache(mem *Memory) error {
 	key := memoryKeyPrefix + mem.UserID
 	data, err := json.Marshal(mem)
@@ -183,99 +321,35 @@ func (ms *MemoryService) saveMemoryToCache(mem *Memory) error {
 	return ms.storage.Set(key, data, memoryCacheTTL)
 }
 
-// ClearMemory clears user memory from cache
+// saveAndPersist writes memory to Redis and, if configured, to MySQL.
+func (ms *MemoryService) saveAndPersist(mem *Memory) error {
+	if err := ms.saveMemoryToCache(mem); err != nil {
+		return err
+	}
+	if ms.memSaveCallback != nil {
+		if err := ms.memSaveCallback(mem); err != nil {
+			ms.logger.WithError(err).Warn("[memory] failed to persist to MySQL")
+		}
+	}
+	return nil
+}
+
+// ClearMemory deletes user memory from Redis and MySQL.
 func (ms *MemoryService) ClearMemory(userID string) error {
 	key := memoryKeyPrefix + userID
-	return ms.storage.Delete(key)
-}
-
-// CalculateContextTokens calculates token count for memory context
-func (ms *MemoryService) CalculateContextTokens(mem *Memory) int {
-	var total int
-
-	// Profile tokens
-	if mem.Profile != "" {
-		total += CalculateTokens(mem.Profile)
+	if err := ms.storage.Delete(key); err != nil {
+		return err
 	}
-
-	// Preferences tokens
-	if mem.Preferences != "" {
-		total += CalculateTokens(mem.Preferences)
-	}
-
-	// Facts tokens
-	for _, fact := range mem.Facts {
-		total += CalculateTokens(fact)
-	}
-
-	// Conversation history tokens
-	for _, turn := range mem.RecentTurns {
-		if turn.UserMessage != "" {
-			total += CalculateTokens(turn.UserMessage)
-		}
-		if turn.AssistantMessage != "" {
-			total += CalculateTokens(turn.AssistantMessage)
+	if ms.memDeleteCallback != nil {
+		if err := ms.memDeleteCallback(userID); err != nil {
+			ms.logger.WithError(err).Warn("[memory] failed to delete from MySQL")
 		}
 	}
-
-	return total
+	return nil
 }
 
-// TrimToBudget trims memory to fit within token budget
-// Removes older conversation turns first to preserve recent context
-func (ms *MemoryService) TrimToBudget(mem *Memory) *Memory {
-	currentTokens := ms.CalculateContextTokens(mem)
-
-	if currentTokens <= ms.tokenBudget {
-		return mem
-	}
-
-	trimmed := &Memory{
-		UserID:      mem.UserID,
-		Profile:     mem.Profile,
-		Preferences: mem.Preferences,
-		Facts:       mem.Facts,
-		UpdatedAt:   time.Now().Format(time.RFC3339),
-	}
-
-	// Trim conversation history from the oldest turns
-	// Keep the most recent turns
-	totalTokens := ms.CalculateContextTokens(trimmed)
-
-	startIdx := 0
-	for totalTokens > ms.tokenBudget && startIdx < len(mem.RecentTurns) {
-		// Skip older turn
-		startIdx++
-
-		// Recalculate with remaining turns
-		remainingTurns := mem.RecentTurns[startIdx:]
-		testMem := &Memory{
-			RecentTurns: remainingTurns,
-		}
-		totalTokens = ms.CalculateContextTokens(trimmed) + ms.CalculateContextTokens(testMem)
-	}
-
-	trimmed.RecentTurns = mem.RecentTurns[startIdx:]
-
-	ms.logger.WithFields(logrus.Fields{
-		"user_id":           mem.UserID,
-		"original_tokens":   currentTokens,
-		"trimmed_tokens":    ms.CalculateContextTokens(trimmed),
-		"turns_removed":     startIdx,
-		"turns_remaining":   len(trimmed.RecentTurns),
-	}).Info("Memory trimmed to fit token budget")
-
-	return trimmed
-}
-
-// FormatForDebug formats memory for debugging (NOT sent to LLM)
+// FormatForDebug formats memory for debugging purposes
 func (ms *MemoryService) FormatForDebug(mem *Memory) string {
-	return fmt.Sprintf("User ID: %s\nProfile: %s\nPreferences: %s\nFacts: %v\nConversation Turns: %d\nLast Updated: %s",
-		mem.UserID,
-		mem.Profile,
-		mem.Preferences,
-		mem.Facts,
-		len(mem.RecentTurns),
-		mem.UpdatedAt,
-	)
+	return fmt.Sprintf("User ID: %s\nProfile: %s\nPreferences: %s\nFacts: %v\nRecentSummary: %s\nLast Updated: %s",
+		mem.UserID, mem.Profile, mem.Preferences, mem.Facts, mem.RecentSummary, mem.UpdatedAt)
 }

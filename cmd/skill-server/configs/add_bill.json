@@ -1,0 +1,39 @@
+{
+  "id": "add_bill",
+  "name": "记账",
+  "description": "记录一笔账单支出或收入",
+  "layer": "org",
+  "supported_pages": ["bills.add", "home"],
+  "tools": [
+    {
+      "name": "add_bill",
+      "description": "将用户的自然语言描述转换为结构化账单并记录，例如：'昨天星巴克38元'",
+      "action_type": "return_direct",
+      "return_template": "已为您记录：{{.category}} {{.amount}}元",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number",
+            "description": "金额（元），必须大于0",
+            "minimum": 0.01
+          },
+          "category": {
+            "type": "string",
+            "description": "消费分类",
+            "enum": ["餐饮", "购物", "交通", "娱乐", "医疗", "其他"]
+          },
+          "description": {
+            "type": "string",
+            "description": "消费描述，如商家名称或备注（可选）"
+          },
+          "date": {
+            "type": "string",
+            "description": "消费日期，格式 YYYY-MM-DD，不填默认今天（可选）"
+          }
+        },
+        "required": ["amount", "category"]
+      }
+    }
+  ]
+}

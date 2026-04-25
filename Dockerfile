@@ -1,65 +1,44 @@
-# Build stage
+# Build target: "server" (default) or "skill-server"
+ARG BUILD_TARGET=server
+
+# ── Builder ──────────────────────────────────────────────────────────────────
 FROM golang:1.21-bullseye AS builder
 
 WORKDIR /app
 
-# Install build dependencies (gcc needed for CGO plugins)
-RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Copy go mod files
 COPY go.mod go.sum* ./
-
-# Download dependencies
 RUN go mod download
 
-# Copy source code
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
-COPY skills/ ./skills/
 
-# Build plugins first
-RUN mkdir -p bin/skills && \
-    find ./skills/financial -name "*.go" -type f -exec sh -c ' \
-        dir=$(dirname "$1"); \
-        name=$(basename "$dir"); \
-        json="$dir/$name.json"; \
-        if [ -f "$json" ]; then \
-            id=$(grep -o "\"id\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$json" | sed "s/.*\"\([^\"]*\)\".*/\1/" | head -1); \
-            [ -z "$id" ] && id="$name"; \
-            go build -buildmode=plugin -o "bin/skills/${id}.so" "$1" || true; \
-        fi \
-    ' sh {} \;
+# Build both binaries (pure Go, no CGO needed)
+RUN CGO_ENABLED=0 GOOS=linux go build -o kapi-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o skill-server ./cmd/skill-server
 
-# Build main application (CGO_ENABLED=1 for plugin support)
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o kapi-server ./cmd/server
-
-# Runtime stage
+# ── Runtime ───────────────────────────────────────────────────────────────────
 FROM debian:bullseye-slim
+
+ARG BUILD_TARGET=server
 
 WORKDIR /app
 
-# Install ca-certificates and wget for HTTPS requests
 RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary and plugins from builder
+# Copy both binaries; CMD选用哪个由 BUILD_TARGET 决定
 COPY --from=builder /app/kapi-server .
-COPY --from=builder /app/bin/skills ./skills
-
-# Make .so files executable
-RUN chmod +x ./skills/*.so
-
-# Copy web-client
+COPY --from=builder /app/skill-server .
 COPY web-client ./web-client
 
-# Create logs directory
 RUN mkdir -p logs
 
-# Expose port
-EXPOSE 8080
+EXPOSE 8080 8090
 
-# Health check
+ENV BUILD_TARGET=${BUILD_TARGET}
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT:-8080}/health || exit 1
 
-# Run the application
-CMD ["./kapi-server"]
+CMD if [ "$BUILD_TARGET" = "skill-server" ]; then ./skill-server; else ./kapi-server; fi

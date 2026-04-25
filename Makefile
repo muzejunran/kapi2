@@ -1,53 +1,39 @@
-.PHONY: build run test clean docker-up docker-down help
+.PHONY: build build-server build-skill run clean test help
 
-# 默认目标
+# ── 默认 ──────────────────────────────────────────────────────────────────────
 help:
 	@echo "AI助手服务系统 - 可用命令："
-	@echo "  make build    - 构建服务"
-	@echo "  make run      - 启动服务（需要Redis）"
-	@echo "  make test     - 运行测试"
-	@echo "  make clean    - 清理构建文件"
-	@echo "  make docker-up   - 启动Redis容器"
-	@echo "  make docker-down - 停止Redis容器"
-	@echo "  make dev      - 开发模式（热重载）"
+	@echo "  make build        - 编译两个服务"
+	@echo "  make run          - 本地启动（需要 Redis）"
+	@echo "  make test         - 运行测试"
+	@echo "  make clean        - 清理构建文件"
 
-# 构建服务
-build:
-	@echo "构建AI助手服务..."
-	@go build -o ai-assistant ./cmd/server/main.go
-	@echo "构建完成: ./ai-assistant"
+# ── 编译 ──────────────────────────────────────────────────────────────────────
+build: build-server build-skill
+	@if [ -d "web-client" ]; then rm -rf bin/web-client && cp -r web-client bin/; fi
+	@echo "✓ 编译完成"
 
-# 启动服务
+build-server:
+	@echo "编译 kapi-server..."
+	@mkdir -p bin
+	@CGO_ENABLED=0 go build -o bin/kapi-server ./cmd/server
+	@echo "✓ kapi-server"
+
+build-skill:
+	@echo "编译 skill-server..."
+	@mkdir -p bin
+	@CGO_ENABLED=0 go build -o bin/skill-server ./cmd/skill-server
+	@echo "✓ skill-server"
+
+# ── 本地运行 ──────────────────────────────────────────────────────────────────
 run: build
-	@echo "启动服务..."
-	@./ai-assistant
+	@./run.sh
 
-# 运行测试
+# ── 其他 ──────────────────────────────────────────────────────────────────────
 test:
 	@echo "运行测试..."
-	@./test.sh
+	@go test ./...
 
-# 清理构建文件
 clean:
-	@echo "清理构建文件..."
-	@rm -f ai-assistant cmd/server/ai-assistant
-	@echo "清理完成"
-
-# 启动Redis容器
-docker-up:
-	@echo "启动Redis容器..."
-	@docker run -d --name redis-assistant -p 6379:6379 redis:7-alpine
-	@echo "Redis已启动"
-
-# 停止Redis容器
-docker-down:
-	@echo "停止Redis容器..."
-	@docker stop redis-assistant 2>/dev/null || true
-	@docker rm redis-assistant 2>/dev/null || true
-	@echo "Redis已停止"
-
-# 开发模式
-dev:
-	@echo "开发模式 - 使用air进行热重载"
-	@which air > /dev/null || (echo "请先安装air: go install github.com/cosmtrek/air@latest" && exit 1)
-	@air
+	@rm -rf bin/kapi-server bin/skill-server bin/web-client
+	@echo "✓ 清理完成"
