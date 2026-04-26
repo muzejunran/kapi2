@@ -15,6 +15,7 @@ import (
 type Server struct {
 	skills    []SkillConfig
 	toolIndex map[string]toolEntry
+	pageIndex PageIndex
 	executor  *Executor
 }
 
@@ -24,9 +25,14 @@ func NewServer(configFS fs.ReadDirFS, configDir string, executor *Executor) (*Se
 	if err != nil {
 		return nil, err
 	}
+	pageIndex, err := LoadPages(configFS, configDir)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		skills:    skills,
 		toolIndex: toolIndex,
+		pageIndex: pageIndex,
 		executor:  executor,
 	}, nil
 }
@@ -52,7 +58,7 @@ func (s *Server) handleGetSkills(w http.ResponseWriter, r *http.Request) {
 	var tools []OpenAITool
 	for _, skill := range s.skills {
 		// empty page_context means no filtering — return all skills
-		if pageContext != "" && !MatchesPage(skill.SupportedPages, pageContext) {
+		if pageContext != "" && !MatchesPage(s.pageIndex, skill.ID, pageContext) {
 			continue
 		}
 		for _, t := range skill.Tools {

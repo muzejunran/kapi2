@@ -9,11 +9,18 @@ import (
 	"testing/fstest"
 )
 
+// handlerPagesJSON uses skill IDs ("billing", "budget_advisor") — not tool names.
+var handlerPagesJSON = []byte(`{
+  "home":         ["billing"],
+  "budget.index": ["budget_advisor"]
+}`)
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	fs := fstest.MapFS{
 		"configs/billing.json": &fstest.MapFile{Data: testSkillJSON},
 		"configs/budget.json":  &fstest.MapFile{Data: testBudgetJSON},
+		"configs/pages.json":   &fstest.MapFile{Data: handlerPagesJSON},
 	}
 	srv, err := NewServer(fs, "configs", NewExecutor(nil, nil))
 	if err != nil {

@@ -1,0 +1,8 @@
+{
+  "home":          ["add_bill", "query_bills"],
+  "bills.list":    ["query_bills", "add_bill"],
+  "bills.detail":  ["query_bills", "add_bill"],
+  "bills.add":     ["add_bill"],
+  "budget.index":  ["budget_advisor"],
+  "budget.detail": ["budget_advisor"]
+}

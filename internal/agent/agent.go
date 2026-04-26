@@ -207,21 +207,49 @@ func (a *Agent) runAgentLoop(ctx context.Context, state *AgentState, streamChan 
 
 	var finalContent strings.Builder
 
+	toolsInRequest := len(tools) > 0
+
+	// When tools are available, append a constraint listing what the LLM CAN do on
+	// this page, so it gives a specific decline instead of a free-form answer.
+	if toolsInRequest {
+		messages[0]["content"] = messages[0]["content"].(string) +
+			"\n\n[工具使用约束]\n当前页面支持的操作：\n" + buildToolCapabilitySummary(tools) +
+			"\n若用户的请求不属于以上操作，请先告知用户该需求在当前页面无法完成，再说明当前页面能做什么，不要自行回答超出范围的内容。"
+	}
+
 	for iter := 0; iter < 5; iter++ {
-		req := a.buildLLMRequest(messages, true)
-		if len(tools) > 0 {
+		var content string
+		var toolCalls []ToolCall
+		var err error
+
+		if toolsInRequest && iter == 0 {
+			// Tool-selection phase: non-streaming — we only need to know which tool the
+			// LLM chose. If it chose none, its content is already the decline message
+			// (enforced by the system prompt above); we stream that directly below.
+			req := a.buildLLMRequest(messages, false)
 			req["tools"] = tools
 			req["tool_choice"] = "auto"
+			content, toolCalls, err = a.callLLMBlocking(ctx, req, state.SessionID)
+		} else {
+			// Response phase (no tools, or summarising tool results): stream directly.
+			req := a.buildLLMRequest(messages, true)
+			if toolsInRequest {
+				req["tools"] = tools
+				req["tool_choice"] = "auto"
+			}
+			content, toolCalls, err = a.callLLMStreamInternal(ctx, req, streamChan, state.SessionID)
 		}
 
-		content, toolCalls, err := a.callLLMStreamInternal(ctx, req, streamChan, state.SessionID)
 		if err != nil {
 			a.logger.WithError(err).Warn("LLM call failed, using fallback")
 			return a.getMockResponse(state, streamChan), nil
 		}
 
-		// No tool calls — pure text reply, done
 		if len(toolCalls) == 0 {
+			if toolsInRequest && iter == 0 {
+				// No tool matched — stream the decline content from the blocking call.
+				streamChan <- streaming.StreamEvent{Type: streaming.TextEvent, Content: content}
+			}
 			finalContent.WriteString(content)
 			break
 		}
@@ -614,6 +642,28 @@ func (a *Agent) callLLMStreamInternal(ctx context.Context, req map[string]interf
 
 // ── Step event helpers ────────────────────────────────────────────────────────
 
+// buildToolCapabilitySummary formats tool names and descriptions into a concise
+// list for inclusion in the system prompt constraint block.
+func buildToolCapabilitySummary(tools []map[string]interface{}) string {
+	var sb strings.Builder
+	for _, t := range tools {
+		fn, ok := t["function"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		desc, _ := fn["description"].(string)
+		sb.WriteString("- ")
+		sb.WriteString(name)
+		if desc != "" {
+			sb.WriteString("：")
+			sb.WriteString(desc)
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 func stepStartMsg(toolName string) string {
 	switch toolName {
 	case "add_bill":
@@ -653,6 +703,109 @@ func stepDoneMsg(toolName string, result map[string]interface{}) string {
 }
 
 // ── Fallback & persistence ────────────────────────────────────────────────────
+
+// callLLMBlocking sends a non-streaming request to the LLM and returns the full
+// response at once. Used for the tool-selection phase so we can inspect tool_calls
+// before deciding whether to stream a decline or proceed with tool execution.
+func (a *Agent) callLLMBlocking(ctx context.Context, req map[string]interface{}, sessionID string) (string, []ToolCall, error) {
+	log := logger.FromContext(ctx)
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return "", nil, err
+	}
+
+	msgCount := 0
+	if msgs, ok := req["messages"].([]map[string]interface{}); ok {
+		msgCount = len(msgs)
+	}
+	toolCount := 0
+	if tools, ok := req["tools"].([]map[string]interface{}); ok {
+		toolCount = len(tools)
+	}
+	log.WithFields(logrus.Fields{
+		"session_id":    sessionID,
+		"model":         req["model"],
+		"message_count": msgCount,
+		"tools_count":   toolCount,
+	}).Info("[llm] blocking request")
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.config.LLMEndpoint, strings.NewReader(string(reqBody)))
+	if err != nil {
+		return "", nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+a.config.LLMApiKey)
+
+	resp, err := a.httpClient.Do(httpReq)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("LLM API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", nil, fmt.Errorf("failed to parse LLM response: %w", err)
+	}
+	if result.Error != nil {
+		return "", nil, fmt.Errorf("LLM API error: %s", result.Error.Message)
+	}
+	if len(result.Choices) == 0 {
+		return "", nil, fmt.Errorf("LLM returned no choices")
+	}
+
+	msg := result.Choices[0].Message
+	toolCalls := make([]ToolCall, 0, len(msg.ToolCalls))
+	for _, tc := range msg.ToolCalls {
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			args = make(map[string]interface{})
+		}
+		toolCalls = append(toolCalls, ToolCall{
+			ID:   tc.ID,
+			Type: tc.Type,
+			Function: ToolFunction{
+				Name:      tc.Function.Name,
+				Arguments: args,
+			},
+		})
+	}
+
+	log.WithFields(logrus.Fields{
+		"session_id":       sessionID,
+		"tool_calls_count": len(toolCalls),
+	}).Info("[llm] blocking response")
+	log.WithField("session_id", sessionID).Debugf("[llm] blocking body: %s", string(body))
+
+	return msg.Content, toolCalls, nil
+}
 
 // getMockResponse returns a keyword-matched reply when the LLM is unreachable
 func (a *Agent) getMockResponse(state *AgentState, streamChan chan<- streaming.StreamEvent) *Message {

@@ -8,7 +8,11 @@ import (
 	"strings"
 )
 
-// LoadSkills 从嵌入的 FS 加载所有 skill 配置，返回 skill 列表和 tool 索引
+// PageIndex maps page names to allowed skill IDs.
+// The special key "*" lists skills available on all pages.
+type PageIndex map[string][]string
+
+// LoadSkills loads all skill JSON configs from configFS/dir, skipping pages.json.
 func LoadSkills(configFS fs.ReadDirFS, dir string) ([]SkillConfig, map[string]toolEntry, error) {
 	entries, err := configFS.ReadDir(dir)
 	if err != nil {
@@ -19,7 +23,7 @@ func LoadSkills(configFS fs.ReadDirFS, dir string) ([]SkillConfig, map[string]to
 	toolIndex := make(map[string]toolEntry)
 
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || entry.Name() == "pages.json" {
 			continue
 		}
 
@@ -39,26 +43,41 @@ func LoadSkills(configFS fs.ReadDirFS, dir string) ([]SkillConfig, map[string]to
 		for _, tool := range cfg.Tools {
 			toolIndex[tool.Name] = toolEntry{Skill: cfg, Tool: tool}
 		}
-		log.Printf("loaded skill: %s (layer=%s, pages=%v, tools=%d)",
-			cfg.ID, cfg.Layer, cfg.SupportedPages, len(cfg.Tools))
+		log.Printf("loaded skill: %s (layer=%s, tools=%d)", cfg.ID, cfg.Layer, len(cfg.Tools))
 	}
 
 	return skills, toolIndex, nil
 }
 
-// toolEntry 内部索引项，用于 tool 快速查找
+// LoadPages loads the page→skill mapping from configFS/dir/pages.json.
+func LoadPages(configFS fs.ReadDirFS, dir string) (PageIndex, error) {
+	data, err := fs.ReadFile(configFS, dir+"/pages.json")
+	if err != nil {
+		return nil, fmt.Errorf("read pages.json: %w", err)
+	}
+	var index PageIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("parse pages.json: %w", err)
+	}
+	return index, nil
+}
+
+// toolEntry is the internal index entry for fast tool lookup.
 type toolEntry struct {
 	Skill SkillConfig
 	Tool  ToolSpec
 }
 
-// MatchesPage 判断 skill 是否对当前页面可用
-func MatchesPage(supportedPages []string, pageContext string) bool {
-	if len(supportedPages) == 0 {
-		return true // 全局 skill，所有页面可用
+// MatchesPage reports whether skillID is available on pageContext.
+// Skills listed under the "*" key in pageIndex are available on all pages.
+func MatchesPage(pageIndex PageIndex, skillID, pageContext string) bool {
+	for _, id := range pageIndex["*"] {
+		if id == skillID {
+			return true
+		}
 	}
-	for _, p := range supportedPages {
-		if p == "*" || p == pageContext {
+	for _, id := range pageIndex[pageContext] {
+		if id == skillID {
 			return true
 		}
 	}
